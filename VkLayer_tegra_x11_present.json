@@ -1,0 +1,29 @@
+{
+    "file_format_version" : "1.0.0",
+    "layer": {
+        "name": "VK_LAYER_TEGRA_x11_present",
+        "type": "GLOBAL",
+        "library_path": "libVkLayer_tegra_x11_present.so",
+        "api_version": "1.1.85",
+        "implementation_version": 1,
+        "description": "X11 Present extension WSI shim for Nvidia Tegra L4T (works around tear-prone WSI in libGLX_nvidia.so.0)",
+        "disable_environment": {
+            "DISABLE_TEGRA_X11_PRESENT": "1"
+        },
+        "enable_environment": {
+            "ENABLE_TEGRA_X11_PRESENT": "1"
+        },
+        "instance_extensions": [],
+        "device_extensions": [
+            {
+                "name": "VK_KHR_swapchain",
+                "spec_version": "70"
+            }
+        ],
+        "functions": {
+            "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "vkGetDeviceProcAddr",
+            "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+        }
+    }
+}
