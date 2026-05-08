@@ -6,7 +6,6 @@
  * dependency on libgbm, in case the build host doesn't ship gbm headers.
  */
 
-#define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdlib.h>

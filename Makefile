@@ -55,7 +55,7 @@ XORG_MODULE_HDRS = xorg_module/tegra_present.h
 XORG_CONF        = packaging/20-tegra-present.conf
 
 XORG_CFLAGS  = $(shell pkg-config --cflags xorg-server 2>/dev/null) \
-               -O2 -Wall -fPIC -fvisibility=hidden -D_GNU_SOURCE
+               -O2 -Wall -fPIC -fvisibility=hidden
 XORG_LDFLAGS = -shared -Wl,--no-undefined -ldl
 
 ifeq ($(HAVE_XORG_SERVER),yes)

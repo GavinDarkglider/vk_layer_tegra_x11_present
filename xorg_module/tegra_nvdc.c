@@ -8,7 +8,6 @@
  * piece 3 (the Present hooks).
  */
 
-#define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stddef.h>
 #include <stdint.h>

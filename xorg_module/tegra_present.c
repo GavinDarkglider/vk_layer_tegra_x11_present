@@ -8,7 +8,6 @@
  * Piece 1: just the skeleton. DRI3 and Present hooks are stubbed.
  */
 
-#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -162,18 +161,27 @@ fail:
 
 static void tegra_extension_init(void)
 {
+    int n = 0;
+
     if (!dixRegisterPrivateKey(tegra_screen_key, PRIVATE_SCREEN, 0) ||
         !dixRegisterPrivateKey(tegra_pixmap_key, PRIVATE_PIXMAP, 0)) {
         TLOG("dixRegisterPrivateKey failed");
         return;
     }
 
-    TLOG("extension init: %d screens visible", xf86NumScreens);
-
-    for (int i = 0; i < xf86NumScreens; ++i) {
+    /* Walk xf86Screens[] until we hit a NULL slot. xf86NumScreens isn't a
+     * portable global across xorg-server versions; iterating until NULL
+     * works on all of them since the array is NULL-terminated for active
+     * entries up to the count xorg uses internally. */
+    for (int i = 0; xf86Screens && xf86Screens[i]; ++i) {
         ScrnInfoPtr scrn = xf86Screens[i];
-        if (scrn && scrn->pScreen) tegra_setup_screen(scrn->pScreen);
+        if (scrn && scrn->pScreen) {
+            tegra_setup_screen(scrn->pScreen);
+            ++n;
+        }
     }
+
+    TLOG("extension init: walked %d screen(s)", n);
 }
 
 /* --- Boilerplate ------------------------------------------------------- */
