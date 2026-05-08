@@ -24,13 +24,22 @@
 
 #define _GNU_SOURCE
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
+#include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+
+/* These platform defines must precede vulkan.h so the XCB / Xlib surface
+ * structures and PFN_ typedefs are exposed.  Without them the ICD-side
+ * surface entry points and types are invisible. */
+#define VK_USE_PLATFORM_XCB_KHR
+#define VK_USE_PLATFORM_XLIB_KHR
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
@@ -306,6 +315,7 @@ static bool format_to_x_depth(VkFormat fmt, uint32_t *depth, uint32_t *bpp)
       default:
          return false;
    }
+   return false;
 }
 
 /* ============================================================ *
