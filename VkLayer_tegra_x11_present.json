@@ -10,9 +10,6 @@
         "disable_environment": {
             "DISABLE_TEGRA_X11_PRESENT": "1"
         },
-        "enable_environment": {
-            "ENABLE_TEGRA_X11_PRESENT": "1"
-        },
         "instance_extensions": [],
         "device_extensions": [
             {
