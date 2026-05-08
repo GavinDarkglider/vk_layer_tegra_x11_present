@@ -276,6 +276,20 @@ static bool surface_init_x11(surface_t *s, xcb_connection_t *xcb,
    s->xcb = xcb;
    s->window = window;
 
+   /* Prefetch DRI3 and Present extension data.
+    * xcb_get_extension_data() only returns cached results — it does NOT
+    * trigger a QueryExtension request if the extension has never been
+    * looked up on this connection.  The Nvidia ICD never queries DRI3
+    * or Present (since its WSI doesn't use them), so when we share the
+    * ICD's xcb_connection_t the cache is empty and the get-data call
+    * returns either NULL or present=0.
+    *
+    * Calling xcb_prefetch_extension_data forces the QueryExtension
+    * request to be sent.  The subsequent xcb_get_extension_data call
+    * blocks for the reply and returns valid data. */
+   xcb_prefetch_extension_data(xcb, &xcb_dri3_id);
+   xcb_prefetch_extension_data(xcb, &xcb_present_id);
+
    /* Probe DRI3 */
    const xcb_query_extension_reply_t *dri3_ext =
       xcb_get_extension_data(xcb, &xcb_dri3_id);
