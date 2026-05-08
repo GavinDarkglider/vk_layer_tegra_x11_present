@@ -56,7 +56,7 @@ XORG_CONF        = packaging/20-tegra-present.conf
 
 XORG_CFLAGS  = $(shell pkg-config --cflags xorg-server 2>/dev/null) \
                -O2 -Wall -fPIC -fvisibility=hidden
-XORG_LDFLAGS = -shared -Wl,--no-undefined -ldl
+XORG_LDFLAGS = -shared -Wl,-Bsymbolic-functions -ldl
 
 ifeq ($(HAVE_XORG_SERVER),yes)
 all: $(LAYER_SO) $(XORG_MODULE_SO)
