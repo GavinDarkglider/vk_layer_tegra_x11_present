@@ -159,20 +159,11 @@ fail:
 
 /* --- Module init ------------------------------------------------------- */
 
-static void tegra_extension_init(void)
+/* Walk all screens, attaching to nvidia ones. Called from the deferred
+ * hook below, after Xorg has finished ScreenInit on every screen. */
+static void tegra_attach_all_screens(void)
 {
     int n = 0;
-
-    if (!dixRegisterPrivateKey(tegra_screen_key, PRIVATE_SCREEN, 0) ||
-        !dixRegisterPrivateKey(tegra_pixmap_key, PRIVATE_PIXMAP, 0)) {
-        TLOG("dixRegisterPrivateKey failed");
-        return;
-    }
-
-    /* Walk xf86Screens[] until we hit a NULL slot. xf86NumScreens isn't a
-     * portable global across xorg-server versions; iterating until NULL
-     * works on all of them since the array is NULL-terminated for active
-     * entries up to the count xorg uses internally. */
     for (int i = 0; xf86Screens && xf86Screens[i]; ++i) {
         ScrnInfoPtr scrn = xf86Screens[i];
         if (scrn && scrn->pScreen) {
@@ -180,8 +171,59 @@ static void tegra_extension_init(void)
             ++n;
         }
     }
+    TLOG("attach pass: walked %d screen(s)", n);
+}
 
-    TLOG("extension init: walked %d screen(s)", n);
+/* ServerGrabCallback fires the first time a client grabs the server, which
+ * happens well after all screens are initialized. We use it as a one-shot
+ * "screens are ready now" signal. After our first run, we deregister.
+ *
+ * If for some reason no client ever grabs the server (unlikely but
+ * possible on a barebones session), we have a fallback BlockHandler that
+ * fires on every main-loop iteration; the first iteration after screens
+ * exist is good enough. Either path triggers the same setup. */
+
+static Bool tegra_attached = FALSE;
+
+static void tegra_attach_once(void)
+{
+    if (tegra_attached) return;
+    tegra_attached = TRUE;
+    TLOG("screens ready hook fired; attaching");
+    tegra_attach_all_screens();
+}
+
+static void tegra_server_grab_cb(CallbackListPtr *list, void *closure,
+                                 void *data)
+{
+    tegra_attach_once();
+}
+
+static void tegra_block_handler(void *data, void *timeout, void *read_mask)
+{
+    /* Fires every main-loop iteration. If we haven't attached yet and
+     * screens now exist, attach. Either way, this is a no-op fast path
+     * after the first run. */
+    if (!tegra_attached && xf86Screens && xf86Screens[0])
+        tegra_attach_once();
+}
+
+static void tegra_extension_init(void)
+{
+    if (!dixRegisterPrivateKey(tegra_screen_key, PRIVATE_SCREEN, 0) ||
+        !dixRegisterPrivateKey(tegra_pixmap_key, PRIVATE_PIXMAP, 0)) {
+        TLOG("dixRegisterPrivateKey failed");
+        return;
+    }
+
+    TLOG("extension init (deferring screen attach until screens are ready)");
+
+    /* Two redundant hooks, whichever fires first wins. */
+    if (!AddCallback(&ServerGrabCallback, tegra_server_grab_cb, NULL))
+        TLOG("AddCallback(ServerGrabCallback) failed; relying on BlockHandler");
+
+    RegisterBlockAndWakeupHandlers(tegra_block_handler,
+                                   (ServerWakeupHandlerProcPtr)NoopDDA, NULL);
 }
 
 /* --- Boilerplate ------------------------------------------------------- */
