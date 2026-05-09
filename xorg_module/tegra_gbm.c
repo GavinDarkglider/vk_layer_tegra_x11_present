@@ -62,11 +62,22 @@ struct tegra_gbm *tegra_gbm_open(void)
     struct tegra_gbm *g = calloc(1, sizeof(*g));
     if (!g) return NULL;
 
-    /* Prefer libnvgbm directly; fall back to libgbm.so.1 in case the
-     * system has the OE4T shim wired in differently. */
-    g->dl = dlopen("libnvgbm.so", RTLD_NOW | RTLD_LOCAL);
-    if (!g->dl) g->dl = dlopen("/usr/lib/libnvgbm.so", RTLD_NOW | RTLD_LOCAL);
-    if (!g->dl) g->dl = dlopen("libgbm.so.1", RTLD_NOW | RTLD_LOCAL);
+    const char *which = NULL;
+
+    /* Prefer Mesa's libgbm.so.1 first. On Lakka, the OE4T tegra-udrm-gbm
+     * shim is registered as a libgbm backend, so going through Mesa's
+     * loader gets us whatever setup the shim performs. Only fall back to
+     * direct libnvgbm if libgbm isn't available, since direct libnvgbm
+     * tries minigbm-style ioctls on tegra-udrm and may fail. */
+    g->dl = dlopen("libgbm.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (g->dl) {
+        which = "libgbm.so.1 (Mesa loader)";
+    } else {
+        g->dl = dlopen("libnvgbm.so", RTLD_NOW | RTLD_LOCAL);
+        if (!g->dl) g->dl = dlopen("/usr/lib/libnvgbm.so",
+                                   RTLD_NOW | RTLD_LOCAL);
+        if (g->dl) which = "libnvgbm.so (direct)";
+    }
     if (!g->dl) {
         TLOG("gbm: dlopen failed: %s", dlerror());
         goto fail;
@@ -84,7 +95,7 @@ struct tegra_gbm *tegra_gbm_open(void)
     G_TRY(g->bo_get_format,    "gbm_bo_get_format");
     G_TRY(g->bo_get_modifier,  "gbm_bo_get_modifier");
 
-    TLOG("gbm: loaded successfully");
+    TLOG("gbm: loaded via %s", which);
     return g;
 
 fail:
