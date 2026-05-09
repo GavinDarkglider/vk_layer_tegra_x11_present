@@ -83,10 +83,49 @@ static Bool tegra_close_screen(ScreenPtr screen)
 
 /* --- Per-screen attach ------------------------------------------------- */
 
+/* Try a few likely device paths for libnvgbm. /dev/dri/card0 is the
+ * obvious one but tegra-udrm is a stub; libnvgbm may want a different
+ * node or may accept any of these. */
+static const char *gbm_device_candidates[] = {
+    "/dev/dri/card0",
+    "/dev/dri/renderD128",
+    "/dev/nvmap",
+    NULL,
+};
+
+static struct gbm_device *
+try_gbm_create(struct tegra_gbm *gbm, int *out_fd, const char **out_path)
+{
+    for (int i = 0; gbm_device_candidates[i]; ++i) {
+        int fd = open(gbm_device_candidates[i], O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            TLOG_V("gbm: open(%s) failed: errno=%d (%s)",
+                   gbm_device_candidates[i], errno, strerror(errno));
+            continue;
+        }
+        struct gbm_device *dev = tegra_gbm_dev_create(gbm, fd);
+        if (dev) {
+            *out_fd   = fd;
+            *out_path = gbm_device_candidates[i];
+            return dev;
+        }
+        TLOG_V("gbm: gbm_create_device on %s failed",
+               gbm_device_candidates[i]);
+        close(fd);
+    }
+    return NULL;
+}
+
 static Bool tegra_setup_screen(ScreenPtr screen)
 {
     ScrnInfoPtr scrn = xf86ScreenToScrn(screen);
     tegra_screen_t *ts;
+
+    /* Already attached? */
+    if (tegra_screen_get(screen)) {
+        TLOG_V("screen %d already attached, skipping", screen->myNum);
+        return TRUE;
+    }
 
     if (!scrn || !scrn->driverName ||
         strcmp(scrn->driverName, "nvidia") != 0) {
@@ -116,17 +155,20 @@ static Bool tegra_setup_screen(ScreenPtr screen)
         goto fail;
     }
 
-    ts->drm_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-    if (ts->drm_fd < 0) {
-        TLOG("open(/dev/dri/card0) failed: errno=%d (%s)",
-             errno, strerror(errno));
-        goto fail;
-    }
-
-    ts->gbm_dev = tegra_gbm_dev_create(ts->gbm, ts->drm_fd);
-    if (!ts->gbm_dev) {
-        TLOG("gbm_create_device failed");
-        goto fail;
+    /* Try several device paths for the GBM device. If all fail, log it
+     * but continue -- piece 1 doesn't actually need GBM yet, and we
+     * want the rest of the bring-up to proceed so we can see other
+     * errors. */
+    {
+        const char *gbm_path = NULL;
+        ts->gbm_dev = try_gbm_create(ts->gbm, &ts->drm_fd, &gbm_path);
+        if (ts->gbm_dev) {
+            TLOG("gbm_create_device succeeded with %s (fd=%d)",
+                 gbm_path, ts->drm_fd);
+        } else {
+            TLOG("gbm_create_device failed on all candidate paths "
+                 "(piece 2 will need this fixed)");
+        }
     }
 
     /* Open libnvdc. The path argument is a guess. */
@@ -174,24 +216,32 @@ static void tegra_attach_all_screens(void)
     TLOG("attach pass: walked %d screen(s)", n);
 }
 
-/* ServerGrabCallback fires the first time a client grabs the server, which
- * happens well after all screens are initialized. We use it as a one-shot
- * "screens are ready now" signal. */
-
 static Bool tegra_attached = FALSE;
 
-static void tegra_attach_once(void)
+static void tegra_attach_once(const char *trigger)
 {
     if (tegra_attached) return;
     tegra_attached = TRUE;
-    TLOG("screens ready hook fired; attaching");
+    TLOG("attach trigger: %s", trigger);
     tegra_attach_all_screens();
 }
 
+/* ClientStateCallback fires on every client state transition. The very
+ * first transition (initial connection of the privileged serverClient,
+ * if nothing else) happens after all screens are ready. */
+static void tegra_client_state_cb(CallbackListPtr *list, void *closure,
+                                  void *data)
+{
+    if (!tegra_attached && xf86Screens && xf86Screens[0])
+        tegra_attach_once("ClientStateCallback");
+}
+
+/* ServerGrabCallback as a backup, in case some session does grab. */
 static void tegra_server_grab_cb(CallbackListPtr *list, void *closure,
                                  void *data)
 {
-    tegra_attach_once();
+    if (!tegra_attached && xf86Screens && xf86Screens[0])
+        tegra_attach_once("ServerGrabCallback");
 }
 
 static void tegra_extension_init(void)
@@ -202,9 +252,10 @@ static void tegra_extension_init(void)
         return;
     }
 
-    TLOG("extension init (deferring screen attach until first server grab)");
+    TLOG("extension init (deferring screen attach until first client connects)");
 
-    AddCallback(&ServerGrabCallback, tegra_server_grab_cb, NULL);
+    AddCallback(&ClientStateCallback, tegra_client_state_cb, NULL);
+    AddCallback(&ServerGrabCallback,  tegra_server_grab_cb,  NULL);
 }
 
 /* --- Boilerplate ------------------------------------------------------- */
