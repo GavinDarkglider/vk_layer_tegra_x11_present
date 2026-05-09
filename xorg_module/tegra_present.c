@@ -186,15 +186,15 @@ static void tegra_extension_init(void)
 
 /* --- Boilerplate ------------------------------------------------------- */
 
-static XF86ModuleVersionInfo tegra_present_vers = {
-    "tegra_present", MODULEVENDORSTRING, MODINFOSTRING1, MODINFOSTRING2,
+static XF86ModuleVersionInfo tegrapresent_vers = {
+    "tegrapresent", MODULEVENDORSTRING, MODINFOSTRING1, MODINFOSTRING2,
     XORG_VERSION_CURRENT, 1, 0, 0,
     ABI_CLASS_EXTENSION, ABI_EXTENSION_VERSION,
     MOD_CLASS_EXTENSION, { 0, 0, 0, 0 }
 };
 
-static pointer tegra_present_setup(pointer module, pointer opts,
-                                   int *errmaj, int *errmin)
+static pointer tegrapresent_setup(pointer module, pointer opts,
+                                  int *errmaj, int *errmin)
 {
     static Bool done = FALSE;
     if (done) {
@@ -206,6 +206,6 @@ static pointer tegra_present_setup(pointer module, pointer opts,
     return (pointer)1;
 }
 
-_X_EXPORT XF86ModuleData tegra_presentModuleData = {
-    &tegra_present_vers, tegra_present_setup, NULL
+_X_EXPORT XF86ModuleData tegrapresentModuleData = {
+    &tegrapresent_vers, tegrapresent_setup, NULL
 };

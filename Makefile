@@ -47,7 +47,7 @@ LAYER_SRC  = vk_layer_tegra_x11_present.c
 # driven off this flag.
 HAVE_XORG_SERVER := $(shell pkg-config --exists xorg-server && echo yes)
 
-XORG_MODULE_SO   = xorg_module/tegra_present.so
+XORG_MODULE_SO   = xorg_module/tegrapresent.so
 XORG_MODULE_SRCS = xorg_module/tegra_present.c \
                    xorg_module/tegra_nvdc.c    \
                    xorg_module/tegra_gbm.c
@@ -56,6 +56,10 @@ XORG_CONF        = packaging/20-tegra-present.conf
 
 XORG_CFLAGS  = $(shell pkg-config --cflags xorg-server 2>/dev/null) \
                -O2 -Wall -fPIC -fvisibility=hidden
+# NOTE: do NOT pass --no-undefined here. Xorg modules have undefined
+# symbols by design -- they are resolved at module-load time against the
+# Xorg server binary itself (xf86MsgVerb, dixRegisterPrivateKey,
+# xf86Screens, etc. live in the Xorg executable, not in a library).
 XORG_LDFLAGS = -shared -Wl,-Bsymbolic-functions -ldl
 
 ifeq ($(HAVE_XORG_SERVER),yes)
@@ -97,7 +101,7 @@ install-xorg-module: $(XORG_MODULE_SO) $(XORG_CONF)
 uninstall:
 	rm -f $(DESTDIR)$(LIBDIR)/$(LAYER_SO)
 	rm -f $(DESTDIR)$(JSONDIR)/$(LAYER_JSON)
-	rm -f $(DESTDIR)$(XORG_MODULE_DIR)/tegra_present.so
+	rm -f $(DESTDIR)$(XORG_MODULE_DIR)/tegrapresent.so
 	rm -f $(DESTDIR)$(XORGCONFD)/20-tegra-present.conf
 
 clean:
