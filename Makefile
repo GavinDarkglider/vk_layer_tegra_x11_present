@@ -31,8 +31,17 @@ ARCH          ?= aarch64-linux-gnu
 LAYERLIBDIR   ?= $(PREFIX)/lib/$(ARCH)
 LAYERJSONDIR  ?= $(PREFIX)/share/vulkan/implicit_layer.d
 
-CC      := $(CROSS_COMPILE)gcc
-INSTALL := install
+# CC selection:
+# - If CC was set on the command line or in the environment, use that (this is
+#   how Lakka and other cross-build recipes inject their toolchain).
+# - Otherwise synthesize from CROSS_COMPILE (which is empty by default, giving
+#   plain "gcc" — fine for native builds).
+# - "make"'s built-in default of CC=cc counts as "default" origin, which is why
+#   we test against that rather than using a plain ?= assignment.
+ifeq ($(origin CC),default)
+CC := $(CROSS_COMPILE)gcc
+endif
+INSTALL ?= install
 
 ifneq ($(SYSROOT),)
 SYSROOT_FLAGS := --sysroot=$(SYSROOT)
