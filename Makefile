@@ -49,22 +49,36 @@ else
 SYSROOT_FLAGS :=
 endif
 
-CFLAGS  ?= -O2 -g -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -fvisibility=hidden
-CFLAGS  += $(SYSROOT_FLAGS)
-LDFLAGS ?= -shared -Wl,--no-undefined -Wl,--version-script=$(MAPFILE) $(SYSROOT_FLAGS)
-LDLIBS  := -lvulkan -lGL -lX11 -lX11-xcb -lxcb -lpthread -ldl -lm
-
 TARGET  := libVkLayer_tegra_x11_present.so
 SRC     := vk_layer_tegra_x11_present.c
 JSON    := vk_layer_tegra_x11_present.json
 MAPFILE := vk_layer_tegra_x11_present.map
+
+CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
+CFLAGS  += $(SYSROOT_FLAGS)
+
+# Always required for a shared library, regardless of what the environment
+# provides in CFLAGS:
+# - -fPIC: position-independent code (mandatory for .so)
+# - -fvisibility=hidden: hide internal symbols (only the three loader-resolved
+#   entrypoints are exported via the version script)
+LAYER_CFLAGS := -fPIC -fvisibility=hidden
+
+# LDFLAGS handling:
+# - The environment / build recipe may set LDFLAGS to inject sysroot, search
+#   paths, hardening flags, etc. We want to combine with those, NOT replace.
+# - But -shared and --version-script are NON-OPTIONAL for our build (without
+#   -shared the linker builds an executable, looks for _start/main, and fails).
+#   So they go into a separate LAYER_LDFLAGS that's always added.
+LAYER_LDFLAGS := -shared -Wl,--no-undefined -Wl,--version-script=$(MAPFILE) $(SYSROOT_FLAGS)
+LDLIBS  := -lvulkan -lGL -lX11 -lX11-xcb -lxcb -lpthread -ldl -lm
 
 .PHONY: all clean install uninstall
 
 all: $(TARGET)
 
 $(TARGET): $(SRC) $(MAPFILE)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC) $(LDLIBS)
+	$(CC) $(LAYER_CFLAGS) $(CFLAGS) $(LAYER_LDFLAGS) $(LDFLAGS) -o $@ $(SRC) $(LDLIBS)
 
 install: all
 	$(INSTALL) -d $(DESTDIR)$(LAYERLIBDIR)
