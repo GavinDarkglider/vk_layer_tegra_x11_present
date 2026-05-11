@@ -1,45 +1,71 @@
-# Makefile for VK_LAYER_TEGRA_x11_present
+# Makefile for vk_layer_tegra_x11_present
 #
-# Build:    make
-# Install:  sudo make install
-# Clean:    make clean
+# Builds an implicit Vulkan layer that fixes Tegra L4T r32.x's broken X11
+# WSI presentation by routing it through GL/GLX. See README.md for the
+# why and how.
+#
+# Variables (override on the make command line or in your build recipe):
+#
+#   CROSS_COMPILE     toolchain prefix, e.g. aarch64-linux-gnu-
+#   SYSROOT           target sysroot for headers and libraries
+#   PREFIX            install prefix (default /usr)
+#   LAYERLIBDIR       where the shared object goes; defaults to a
+#                     multiarch path under $(PREFIX)/lib but Lakka and
+#                     other distros that don't use multiarch should
+#                     override this to plain $(PREFIX)/lib
+#   LAYERJSONDIR      where the implicit-layer JSON goes; default is
+#                     /usr/share/vulkan/implicit_layer.d
+#   DESTDIR           staging root for installation
+#
+# The library_path in the JSON is intentionally a bare filename, not an
+# absolute path, so the Vulkan loader searches the standard library dirs
+# and the same JSON works regardless of where LAYERLIBDIR puts the .so.
 
-CC      ?= gcc
-CFLAGS  += -O2 -Wall -Wno-unused-function -fPIC -fvisibility=hidden -pthread
-LDFLAGS += -shared -Wl,--no-undefined
+CROSS_COMPILE ?=
+SYSROOT       ?=
+PREFIX        ?= /usr
 
-LIBS = $(shell pkg-config --libs xcb xcb-dri3 xcb-present x11-xcb 2>/dev/null)
-CFLAGS += $(shell pkg-config --cflags xcb xcb-dri3 xcb-present x11-xcb 2>/dev/null)
+# Default to Ubuntu/Debian multiarch. Lakka's package recipe overrides
+# this to $(PREFIX)/lib.
+ARCH          ?= aarch64-linux-gnu
+LAYERLIBDIR   ?= $(PREFIX)/lib/$(ARCH)
+LAYERJSONDIR  ?= $(PREFIX)/share/vulkan/implicit_layer.d
 
-# Fallback if pkg-config is unavailable
-ifeq ($(LIBS),)
-LIBS = -lxcb -lxcb-dri3 -lxcb-present -lX11-xcb -lpthread
+CC      := $(CROSS_COMPILE)gcc
+INSTALL := install
+
+ifneq ($(SYSROOT),)
+SYSROOT_FLAGS := --sysroot=$(SYSROOT)
+else
+SYSROOT_FLAGS :=
 endif
 
-PREFIX  ?= /usr
-LIBDIR  ?= $(PREFIX)/lib/aarch64-linux-gnu
-JSONDIR ?= /etc/vulkan/implicit_layer.d
+CFLAGS  ?= -O2 -g -fPIC -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -fvisibility=hidden
+CFLAGS  += $(SYSROOT_FLAGS)
+LDFLAGS ?= -shared -Wl,--no-undefined -Wl,--version-script=$(MAPFILE) $(SYSROOT_FLAGS)
+LDLIBS  := -lvulkan -lGL -lX11 -lX11-xcb -lxcb -lpthread -ldl -lm
 
-LAYER_SO   = libVkLayer_tegra_x11_present.so
-LAYER_JSON = VkLayer_tegra_x11_present.json
-LAYER_SRC  = vk_layer_tegra_x11_present.c
+TARGET  := libVkLayer_tegra_x11_present.so
+SRC     := vk_layer_tegra_x11_present.c
+JSON    := vk_layer_tegra_x11_present.json
+MAPFILE := vk_layer_tegra_x11_present.map
 
-all: $(LAYER_SO)
+.PHONY: all clean install uninstall
 
-$(LAYER_SO): $(LAYER_SRC)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+all: $(TARGET)
 
-install: $(LAYER_SO) $(LAYER_JSON)
-	install -d $(DESTDIR)$(LIBDIR)
-	install -m 0755 $(LAYER_SO) $(DESTDIR)$(LIBDIR)/
-	install -d $(DESTDIR)$(JSONDIR)
-	install -m 0644 $(LAYER_JSON) $(DESTDIR)$(JSONDIR)/
+$(TARGET): $(SRC) $(MAPFILE)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC) $(LDLIBS)
+
+install: all
+	$(INSTALL) -d $(DESTDIR)$(LAYERLIBDIR)
+	$(INSTALL) -m 0755 $(TARGET) $(DESTDIR)$(LAYERLIBDIR)/$(TARGET)
+	$(INSTALL) -d $(DESTDIR)$(LAYERJSONDIR)
+	$(INSTALL) -m 0644 $(JSON) $(DESTDIR)$(LAYERJSONDIR)/$(JSON)
 
 uninstall:
-	rm -f $(DESTDIR)$(LIBDIR)/$(LAYER_SO)
-	rm -f $(DESTDIR)$(JSONDIR)/$(LAYER_JSON)
+	rm -f $(DESTDIR)$(LAYERLIBDIR)/$(TARGET)
+	rm -f $(DESTDIR)$(LAYERJSONDIR)/$(JSON)
 
 clean:
-	rm -f $(LAYER_SO)
-
-.PHONY: all install uninstall clean
+	rm -f $(TARGET)

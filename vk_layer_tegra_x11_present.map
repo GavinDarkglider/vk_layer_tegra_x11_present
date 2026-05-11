@@ -1,0 +1,11 @@
+/* Limit the set of externally visible symbols to exactly the three the
+   Vulkan loader looks up by name. Everything else is internal regardless
+   of attribute. */
+{
+    global:
+        vkGetInstanceProcAddr;
+        vkGetDeviceProcAddr;
+        vkNegotiateLoaderLayerInterfaceVersion;
+    local:
+        *;
+};
