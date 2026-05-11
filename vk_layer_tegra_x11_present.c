@@ -772,6 +772,18 @@ static bool gl_import_image(Swapchain *sc, PerImage *pi) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    /* The bytes in our image memory are laid out in the Vulkan format's
+       channel order: BGRA for B8G8R8A8_*, RGBA for R8G8B8A8_*. GL's sampling
+       always pretends the texture is RGBA. For BGRA-format swapchains we
+       therefore have to remap R<->B at sample time so red and blue come
+       from the right bytes. */
+    if (sc->format == VK_FORMAT_B8G8R8A8_UNORM || sc->format == VK_FORMAT_B8G8R8A8_SRGB) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
+    }
     return true;
 }
 
