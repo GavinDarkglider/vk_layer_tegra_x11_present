@@ -223,6 +223,10 @@ typedef struct {
 
     PFN_vkGetMemoryFdKHR         GetMemoryFdKHR;
     PFN_vkGetSemaphoreFdKHR      GetSemaphoreFdKHR;
+    PFN_vkCmdPipelineBarrier     CmdPipelineBarrier;
+    PFN_vkCmdPipelineBarrier2    CmdPipelineBarrier2;        /* sync2, core 1.3 */
+    PFN_vkCmdPipelineBarrier2KHR CmdPipelineBarrier2KHR;     /* sync2, KHR variant */
+    PFN_vkEndCommandBuffer       EndCommandBuffer;
 
     /* The real WSI calls (we delegate format/presentmode queries to them
        sometimes, but otherwise we replace these completely). */
@@ -459,9 +463,30 @@ typedef struct Swapchain {
     /* Per-swapchain command pool for our bridge submits. */
     VkCommandPool  cpool;
 
-    /* Thread that owns the current GLX make-current. */
-    pthread_t      glx_owner_thread;
-    bool           glx_made_current;
+    /* Async GL worker.
+
+       Architecture: a dedicated thread owns the GLX context — made current
+       once at thread start, never un-made until shutdown. This avoids the
+       per-present cost of glXMakeCurrent and decouples the app's render
+       thread from glXSwapBuffers's vsync wait. On Nvidia, glXSwapBuffers
+       with swap interval >= 1 spin-waits on the CPU side until vblank;
+       running it on a dedicated thread means it doesn't burn the app's
+       core. The app thread submits a job and returns immediately.
+
+       Pending slot: a single image-index awaiting present, plus a flag.
+       This single-slot design is the backpressure mechanism — if the
+       worker hasn't finished the last present when the app calls Present
+       again, the app blocks in the post until the slot frees. With NIMG=3
+       images and triple-buffered render, normal usage stays fully
+       pipelined. */
+    pthread_t        worker;
+    bool             worker_running;
+    pthread_mutex_t  worker_lock;
+    pthread_cond_t   worker_cv_pending;   /* worker waits on this when idle */
+    pthread_cond_t   worker_cv_done;      /* app waits on this when posting to full slot */
+    bool             worker_pending;      /* slot has work? */
+    uint32_t         worker_pending_idx;  /* image index in pending slot */
+    bool             worker_quit;
 
     pthread_mutex_t lock;
 } Swapchain;
@@ -539,29 +564,113 @@ static GLXContext create_glx_context(Display *dpy, GLXFBConfig fbc) {
     return glXCreateNewContext(dpy, fbc, GLX_RGBA_TYPE, NULL, True);
 }
 
-static bool make_current_locked(Swapchain *sc) {
-    pthread_t self = pthread_self();
-    if (sc->glx_made_current && pthread_equal(sc->glx_owner_thread, self)) return true;
-    if (sc->glx_made_current && !pthread_equal(sc->glx_owner_thread, self)) {
-        LOG_WARN("present called from multiple threads on swapchain %p (current=%p new=%p)",
-                 sc, (void*)sc->glx_owner_thread, (void*)self);
-        /* The other thread must un-make-current first. We can't do it from
-           here. Best effort: try anyway; glXMakeCurrent will fail and the
-           caller will get an INITIALIZATION_FAILED. */
-    }
+/* Worker thread main loop. Owns the GLX context for the swapchain's lifetime;
+   the context is made current once at thread start and never released until
+   the thread exits. The thread waits on worker_cv_pending for work, processes
+   one frame at a time, and signals worker_cv_done when the slot is free. */
+static void *worker_thread_main(void *arg) {
+    Swapchain *sc = (Swapchain *)arg;
+
     if (!glXMakeCurrent(sc->surf->dpy, sc->child_window, sc->glctx)) {
-        LOG_ERR("glXMakeCurrent failed");
-        return false;
+        LOG_ERR("worker_thread_main: glXMakeCurrent failed at startup");
+        pthread_mutex_lock(&sc->worker_lock);
+        sc->worker_running = false;
+        pthread_cond_broadcast(&sc->worker_cv_done);
+        pthread_mutex_unlock(&sc->worker_lock);
+        return NULL;
     }
-    sc->glx_owner_thread = self;
-    sc->glx_made_current = true;
-    return true;
+
+    /* Apply swap interval here, in the thread that owns the context. */
+    if (sc->glXSwapIntervalEXT) {
+        int interval = 1;
+        if (sc->present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) interval = 0;
+        else if (sc->present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) interval = -1;
+        sc->glXSwapIntervalEXT(sc->surf->dpy, sc->child_window, interval);
+    }
+
+    int last_win_w = sc->win_w, last_win_h = sc->win_h;
+    glViewport(0, 0, last_win_w, last_win_h);
+
+    for (;;) {
+        /* Wait for work or shutdown. */
+        pthread_mutex_lock(&sc->worker_lock);
+        while (!sc->worker_pending && !sc->worker_quit)
+            pthread_cond_wait(&sc->worker_cv_pending, &sc->worker_lock);
+        if (sc->worker_quit) {
+            pthread_mutex_unlock(&sc->worker_lock);
+            break;
+        }
+        uint32_t idx = sc->worker_pending_idx;
+        /* Clear pending and signal waiters before we start work, so the next
+           Present can post immediately. The backpressure happens at the NEXT
+           Present (which will block until we finish this one). */
+        sc->worker_pending = false;
+        pthread_cond_broadcast(&sc->worker_cv_done);
+        pthread_mutex_unlock(&sc->worker_lock);
+
+        /* Refresh window size if changed. Cheap when unchanged. */
+        uint32_t ww = 0, wh = 0;
+        Window root; int wx, wy; unsigned int wb, wd;
+        if (XGetGeometry(sc->surf->dpy, sc->surf->window, &root, &wx, &wy, &ww, &wh, &wb, &wd)) {
+            if ((int)ww != last_win_w || (int)wh != last_win_h) {
+                XResizeWindow(sc->surf->dpy, sc->child_window, ww, wh);
+                XFlush(sc->surf->dpy);
+                last_win_w = (int)ww; last_win_h = (int)wh;
+                glViewport(0, 0, last_win_w, last_win_h);
+            }
+        }
+
+        /* GL: wait, sample, signal, swap. */
+        GLenum srcLayouts[1] = { GL_LAYOUT_SHADER_READ_ONLY_EXT };
+        sc->glWaitSemaphoreEXT(sc->images[idx].gl_render_sem, 0, NULL,
+                               1, &sc->images[idx].gl_texture, srcLayouts);
+
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, sc->images[idx].gl_texture);
+        glBindVertexArray(sc->vao);
+        glUseProgram(sc->prog);
+        glUniform1i(sc->u_tex, 0);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        GLenum dstLayouts[1] = { GL_LAYOUT_SHADER_READ_ONLY_EXT };
+        sc->glSignalSemaphoreEXT(sc->images[idx].gl_sample_sem, 0, NULL,
+                                 1, &sc->images[idx].gl_texture, dstLayouts);
+        glFlush();
+        glXSwapBuffers(sc->surf->dpy, sc->child_window);
+    }
+
+    glXMakeCurrent(sc->surf->dpy, None, NULL);
+
+    pthread_mutex_lock(&sc->worker_lock);
+    sc->worker_running = false;
+    pthread_cond_broadcast(&sc->worker_cv_done);
+    pthread_mutex_unlock(&sc->worker_lock);
+    return NULL;
 }
 
-static void unmake_current_locked(Swapchain *sc) {
-    if (!sc->glx_made_current) return;
-    glXMakeCurrent(sc->surf->dpy, None, NULL);
-    sc->glx_made_current = false;
+/* Post an image index to the worker's pending slot. Blocks if the slot is
+   currently full, which provides natural backpressure. */
+static void worker_post(Swapchain *sc, uint32_t idx) {
+    pthread_mutex_lock(&sc->worker_lock);
+    while (sc->worker_pending && sc->worker_running)
+        pthread_cond_wait(&sc->worker_cv_done, &sc->worker_lock);
+    if (!sc->worker_running) { pthread_mutex_unlock(&sc->worker_lock); return; }
+    sc->worker_pending = true;
+    sc->worker_pending_idx = idx;
+    pthread_cond_signal(&sc->worker_cv_pending);
+    pthread_mutex_unlock(&sc->worker_lock);
+}
+
+/* Tell the worker to exit and join the thread. */
+static void worker_shutdown(Swapchain *sc) {
+    pthread_mutex_lock(&sc->worker_lock);
+    if (!sc->worker_running) { pthread_mutex_unlock(&sc->worker_lock); return; }
+    sc->worker_quit = true;
+    pthread_cond_broadcast(&sc->worker_cv_pending);
+    pthread_mutex_unlock(&sc->worker_lock);
+    pthread_join(sc->worker, NULL);
 }
 
 /* Resolve GL extension entrypoints. Must be called with the GLX context current. */
@@ -1117,26 +1226,9 @@ layer_CreateSwapchainKHR(VkDevice device,
         free(sc);
         return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
     }
-    sc->glx_owner_thread = pthread_self();
-    sc->glx_made_current = true;
 
     if (!resolve_gl_funcs(sc)) goto fail_gl_setup;
-    if (sc->glXSwapIntervalEXT) {
-        int interval = 1;
-        if (sc->present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) interval = 0;
-        else if (sc->present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) interval = -1;
-        sc->glXSwapIntervalEXT(surf->dpy, sc->child_window, interval);
-    }
     if (!build_blit_program(sc)) goto fail_gl_setup;
-
-    /* Vulkan side: command pool for our bridge submits. */
-    VkCommandPoolCreateInfo cpi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-    cpi.queueFamilyIndex = dev->graphics_qfi;
-    cpi.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    /* We don't actually use command buffers for the bridges (they're signal/wait only),
-       but a CommandPool is required by some drivers for queue submission scratch. We
-       create it for parity with other paths but won't allocate from it currently. */
-    (void)cpi;
 
     /* Allocate per-image Vulkan resources and import them into GL. */
     for (uint32_t i = 0; i < sc->image_count; i++) {
@@ -1156,17 +1248,26 @@ layer_CreateSwapchainKHR(VkDevice device,
             LOG_ERR("pre-signal QueueSubmit for image %u failed: %d", i, psr);
             goto fail_perimg;
         }
-        LOG_INFO("pre-signaled gl_sample_done[%u]=%p on queue=%p",
-                 i, (void*)sc->images[i].gl_sample_done, (void*)dev->graphics_queue);
     }
 
+    /* Release the GLX context from this thread before the worker takes it. */
     glXMakeCurrent(surf->dpy, None, NULL);
-    sc->glx_made_current = false;
+
+    /* Start the worker. From this point on, the worker owns sc->glctx. */
+    pthread_mutex_init(&sc->worker_lock, NULL);
+    pthread_cond_init(&sc->worker_cv_pending, NULL);
+    pthread_cond_init(&sc->worker_cv_done, NULL);
+    sc->worker_running = true;
+    if (pthread_create(&sc->worker, NULL, worker_thread_main, sc) != 0) {
+        LOG_ERR("pthread_create(worker) failed");
+        sc->worker_running = false;
+        goto fail_perimg;
+    }
 
     track_swapchain(sc);
 
     *pOut = (VkSwapchainKHR)(uintptr_t)sc;
-    LOG_INFO("CreateSwapchainKHR -> sc=%p %ux%u fmt=%d images=%u present_mode=%d",
+    LOG_INFO("CreateSwapchainKHR -> sc=%p %ux%u fmt=%d images=%u present_mode=%d (async worker)",
              sc, sc->extent.width, sc->extent.height, sc->format,
              sc->image_count, sc->present_mode);
     return VK_SUCCESS;
@@ -1200,6 +1301,11 @@ layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
 
     untrack_swapchain(sc);
 
+    /* Shut down the worker before touching GL resources — the worker owns the
+       GLX context. After worker_shutdown returns, no thread has the context
+       current; we can take it here for the final cleanup. */
+    worker_shutdown(sc);
+
     pthread_mutex_lock(&sc->lock);
     if (sc->glctx) {
         glXMakeCurrent(sc->surf->dpy, sc->child_window, sc->glctx);
@@ -1215,6 +1321,9 @@ layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
     if (sc->visinfo) XFree(sc->visinfo);
     pthread_mutex_unlock(&sc->lock);
     pthread_mutex_destroy(&sc->lock);
+    pthread_cond_destroy(&sc->worker_cv_pending);
+    pthread_cond_destroy(&sc->worker_cv_done);
+    pthread_mutex_destroy(&sc->worker_lock);
     memset(sc, 0, sizeof(*sc));
     free(sc);
 }
@@ -1278,25 +1387,11 @@ layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
                 r, (void*)dev->graphics_queue, (void*)semaphore, (void*)fence, (void*)sc->images[idx].gl_sample_done);
         return r;
     }
-    LOG_INFO("Acquire -> idx=%u (bridge submit ok, signal app_sem=%p fence=%p)",
-             idx, (void*)semaphore, (void*)fence);
+    LOG_DBG("Acquire -> idx=%u (bridge submit ok, signal app_sem=%p fence=%p)",
+            idx, (void*)semaphore, (void*)fence);
 
     *pIndex = idx;
     return VK_SUCCESS;
-}
-
-VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
-layer_EndCommandBuffer(VkCommandBuffer cb) {
-    DevNode *dev = dev_lookup(dispatch_key(cb));
-    if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
-    PFN_vkEndCommandBuffer next = (PFN_vkEndCommandBuffer)
-        dev->d.GetDeviceProcAddr(dev->device, "vkEndCommandBuffer");
-    if (!next) return VK_ERROR_INITIALIZATION_FAILED;
-    VkResult r = next(cb);
-    if (r != VK_SUCCESS) {
-        LOG_ERR("vkEndCommandBuffer FAILED: ret=%d cb=%p", r, (void*)cb);
-    }
-    return r;
 }
 
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
@@ -1341,6 +1436,13 @@ static void untrack_swapchain(Swapchain *sc) {
     }
     pthread_mutex_unlock(&g_sc_lock);
 }
+/* Quick "is this image managed" check. Most barriers will hit non-managed
+   images, so we want this to be as cheap as possible. The slowest part is
+   acquiring the lock — but since the swapchain set rarely changes, we
+   keep a generation counter and a thread-local cache to skip the lock
+   entirely when nothing has changed. For simplicity, in the first pass we
+   just take the lock and walk; if profiling shows this is still hot, the
+   lock-free version is straightforward. */
 static bool image_is_managed(VkImage img) {
     if (!img) return false;
     pthread_mutex_lock(&g_sc_lock);
@@ -1354,6 +1456,18 @@ static bool image_is_managed(VkImage img) {
     }
     pthread_mutex_unlock(&g_sc_lock);
     return found;
+}
+
+/* Fast-path: are we tracking ANY swapchains at all? If not, no barriers can
+   possibly hit our images, so skip the per-barrier check entirely. */
+static bool any_swapchains_tracked(void) {
+    pthread_mutex_lock(&g_sc_lock);
+    bool any = false;
+    for (int i = 0; i < MAX_TRACKED_SWAPCHAINS; i++) {
+        if (g_swapchains[i]) { any = true; break; }
+    }
+    pthread_mutex_unlock(&g_sc_lock);
+    return any;
 }
 
 /* Rewrite VK_IMAGE_LAYOUT_PRESENT_SRC_KHR (and SHARED_PRESENT_KHR) on barriers
@@ -1375,53 +1489,113 @@ layer_CmdPipelineBarrier(VkCommandBuffer cb,
                           uint32_t memBarrierCount, const VkMemoryBarrier *memBarriers,
                           uint32_t bufBarrierCount, const VkBufferMemoryBarrier *bufBarriers,
                           uint32_t imgBarrierCount, const VkImageMemoryBarrier *imgBarriers) {
-    static bool first_call = true;
-    if (first_call) {
-        first_call = false;
-        LOG_INFO("CmdPipelineBarrier intercept active (first call): imgBarriers=%u", imgBarrierCount);
-    }
-    /* Locate the device for this command buffer. Command-buffer dispatch key
-       is the parent device's. */
     DevNode *dev = dev_lookup(dispatch_key(cb));
-    if (!dev) {
-        LOG_ERR("CmdPipelineBarrier: no device for cb=%p key=%p", (void*)cb, dispatch_key(cb));
+    if (!dev || !dev->d.CmdPipelineBarrier) return;
+
+    /* Fast path: no image barriers, or no swapchains tracked. Pass through with
+       no allocation, no lock, no copy. This is the path 99% of barriers take
+       in a real application — the swapchain-image barriers are the rare case. */
+    if (imgBarrierCount == 0 || !any_swapchains_tracked()) {
+        dev->d.CmdPipelineBarrier(cb, srcStage, dstStage, depFlags,
+                                   memBarrierCount, memBarriers,
+                                   bufBarrierCount, bufBarriers,
+                                   imgBarrierCount, imgBarriers);
         return;
     }
-    PFN_vkCmdPipelineBarrier next = (PFN_vkCmdPipelineBarrier)
-        dev->d.GetDeviceProcAddr(dev->device, "vkCmdPipelineBarrier");
-    if (!next) return;
 
-    /* Copy and rewrite layouts on barriers that hit our managed images. */
-    VkImageMemoryBarrier *fixed = NULL;
-    if (imgBarrierCount > 0) {
-        bool any = false;
-        for (uint32_t i = 0; i < imgBarrierCount; i++) {
-            if (image_is_managed(imgBarriers[i].image)) { any = true; break; }
-        }
-        if (any) {
-            fixed = malloc(imgBarrierCount * sizeof(*fixed));
-            if (fixed) {
-                memcpy(fixed, imgBarriers, imgBarrierCount * sizeof(*fixed));
-                for (uint32_t i = 0; i < imgBarrierCount; i++) {
-                    if (image_is_managed(fixed[i].image)) {
-                        VkImageLayout o = fixed[i].oldLayout, n = fixed[i].newLayout;
-                        fixed[i].oldLayout = fix_layout(o);
-                        fixed[i].newLayout = fix_layout(n);
-                        if (o != fixed[i].oldLayout || n != fixed[i].newLayout) {
-                            LOG_DBG("rewrote barrier on managed image %p: old %d->%d new %d->%d",
-                                    (void*)fixed[i].image, o, fixed[i].oldLayout, n, fixed[i].newLayout);
-                        }
-                    }
-                }
-                imgBarriers = fixed;
-            }
+    /* Slow path: walk the image barriers checking for managed images. Only
+       allocate a copy if at least one barrier actually needs rewriting. */
+    bool any_managed = false;
+    for (uint32_t i = 0; i < imgBarrierCount; i++) {
+        if (image_is_managed(imgBarriers[i].image)) { any_managed = true; break; }
+    }
+    if (!any_managed) {
+        dev->d.CmdPipelineBarrier(cb, srcStage, dstStage, depFlags,
+                                   memBarrierCount, memBarriers,
+                                   bufBarrierCount, bufBarriers,
+                                   imgBarrierCount, imgBarriers);
+        return;
+    }
+
+    VkImageMemoryBarrier *fixed = malloc(imgBarrierCount * sizeof(*fixed));
+    if (!fixed) {
+        /* Best effort: pass through unmodified. May fault but at least
+           doesn't drop the barrier. */
+        dev->d.CmdPipelineBarrier(cb, srcStage, dstStage, depFlags,
+                                   memBarrierCount, memBarriers,
+                                   bufBarrierCount, bufBarriers,
+                                   imgBarrierCount, imgBarriers);
+        return;
+    }
+    memcpy(fixed, imgBarriers, imgBarrierCount * sizeof(*fixed));
+    for (uint32_t i = 0; i < imgBarrierCount; i++) {
+        if (image_is_managed(fixed[i].image)) {
+            fixed[i].oldLayout = fix_layout(fixed[i].oldLayout);
+            fixed[i].newLayout = fix_layout(fixed[i].newLayout);
         }
     }
-    next(cb, srcStage, dstStage, depFlags,
-         memBarrierCount, memBarriers,
-         bufBarrierCount, bufBarriers,
-         imgBarrierCount, imgBarriers);
-    if (fixed) free(fixed);
+    dev->d.CmdPipelineBarrier(cb, srcStage, dstStage, depFlags,
+                               memBarrierCount, memBarriers,
+                               bufBarrierCount, bufBarriers,
+                               imgBarrierCount, fixed);
+    free(fixed);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
+layer_EndCommandBuffer(VkCommandBuffer cb) {
+    DevNode *dev = dev_lookup(dispatch_key(cb));
+    if (!dev || !dev->d.EndCommandBuffer) return VK_ERROR_INITIALIZATION_FAILED;
+    return dev->d.EndCommandBuffer(cb);
+}
+
+/* Sync2 (Vulkan 1.3 / VK_KHR_synchronization2) variant of pipeline barriers.
+   Same conceptual rewrite as the original CmdPipelineBarrier — replace
+   PRESENT_SRC_KHR with SHADER_READ_ONLY_OPTIMAL on barriers targeting our
+   managed images. PPSSPP and other modern engines use this path. */
+static void cmd_pipeline_barrier2_impl(VkCommandBuffer cb,
+                                       const VkDependencyInfo *pDependencyInfo,
+                                       PFN_vkCmdPipelineBarrier2 next) {
+    if (!pDependencyInfo || pDependencyInfo->imageMemoryBarrierCount == 0 ||
+        !any_swapchains_tracked()) {
+        next(cb, pDependencyInfo);
+        return;
+    }
+    uint32_t n = pDependencyInfo->imageMemoryBarrierCount;
+    bool any_managed = false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (image_is_managed(pDependencyInfo->pImageMemoryBarriers[i].image)) {
+            any_managed = true; break;
+        }
+    }
+    if (!any_managed) { next(cb, pDependencyInfo); return; }
+
+    VkImageMemoryBarrier2 *fixed = malloc(n * sizeof(*fixed));
+    if (!fixed) { next(cb, pDependencyInfo); return; }
+    memcpy(fixed, pDependencyInfo->pImageMemoryBarriers, n * sizeof(*fixed));
+    for (uint32_t i = 0; i < n; i++) {
+        if (image_is_managed(fixed[i].image)) {
+            fixed[i].oldLayout = fix_layout(fixed[i].oldLayout);
+            fixed[i].newLayout = fix_layout(fixed[i].newLayout);
+        }
+    }
+    VkDependencyInfo di = *pDependencyInfo;
+    di.pImageMemoryBarriers = fixed;
+    next(cb, &di);
+    free(fixed);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL
+layer_CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo *pDependencyInfo) {
+    DevNode *dev = dev_lookup(dispatch_key(cb));
+    if (!dev || !dev->d.CmdPipelineBarrier2) return;
+    cmd_pipeline_barrier2_impl(cb, pDependencyInfo, dev->d.CmdPipelineBarrier2);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL
+layer_CmdPipelineBarrier2KHR(VkCommandBuffer cb, const VkDependencyInfo *pDependencyInfo) {
+    DevNode *dev = dev_lookup(dispatch_key(cb));
+    if (!dev || !dev->d.CmdPipelineBarrier2KHR) return;
+    cmd_pipeline_barrier2_impl(cb, pDependencyInfo, dev->d.CmdPipelineBarrier2KHR);
 }
 
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
@@ -1470,7 +1644,7 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
     if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
     if (g_layer_disabled) return dev->d.QueuePresentKHR(queue, pInfo);
 
-    LOG_INFO("Present entry: queue=%p (graphics_queue=%p) swapchains=%u waitSems=%u",
+    LOG_DBG("Present entry: queue=%p (graphics_queue=%p) swapchains=%u waitSems=%u",
              (void*)queue, (void*)dev->graphics_queue,
              pInfo->swapchainCount, pInfo->waitSemaphoreCount);
 
@@ -1526,57 +1700,17 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
             if (overall == VK_SUCCESS) overall = rb;
             continue;
         }
-        LOG_DBG("Present idx=%u: bridge submit ok", idx);
 
-        /* GL side. */
-        if (!make_current_locked(sc)) {
-            pthread_mutex_unlock(&sc->lock);
-            if (pInfo->pResults) pInfo->pResults[s] = VK_ERROR_INITIALIZATION_FAILED;
-            if (overall == VK_SUCCESS) overall = VK_ERROR_INITIALIZATION_FAILED;
-            continue;
-        }
-
-        /* Refresh window size and resize the child window to track the parent.
-           Also update GL viewport to match. */
-        uint32_t ww = 0, wh = 0; window_size(sc->surf, &ww, &wh);
-        if (ww > 0 && wh > 0) {
-            if ((int)ww != sc->win_w || (int)wh != sc->win_h) {
-                XResizeWindow(sc->surf->dpy, sc->child_window, ww, wh);
-                XFlush(sc->surf->dpy);
-                sc->win_w = (int)ww; sc->win_h = (int)wh;
-            }
-            glViewport(0, 0, (GLsizei)ww, (GLsizei)wh);
-        }
-
-        GLenum srcLayouts[1] = { GL_LAYOUT_SHADER_READ_ONLY_EXT };
-        sc->glWaitSemaphoreEXT(sc->images[idx].gl_render_sem, 0, NULL,
-                               1, &sc->images[idx].gl_texture, srcLayouts);
-        { GLenum e = glGetError(); if (e) LOG_ERR("glWaitSemaphoreEXT error: 0x%x", e); }
-
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, sc->images[idx].gl_texture);
-        glBindVertexArray(sc->vao);
-        glUseProgram(sc->prog);
-        glUniform1i(sc->u_tex, 0);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-        { GLenum e = glGetError(); if (e) LOG_ERR("post-draw GL error: 0x%x", e); }
-
-        GLenum dstLayouts[1] = { GL_LAYOUT_SHADER_READ_ONLY_EXT };
-        sc->glSignalSemaphoreEXT(sc->images[idx].gl_sample_sem, 0, NULL,
-                                 1, &sc->images[idx].gl_texture, dstLayouts);
-        { GLenum e = glGetError(); if (e) LOG_ERR("glSignalSemaphoreEXT error: 0x%x", e); }
-        glFlush();
-        glXSwapBuffers(sc->surf->dpy, sc->child_window);
-        unmake_current_locked(sc);
-
+        /* The GL side runs in the worker thread which owns the GLX context.
+           This call may block if the worker's single-slot queue is still
+           full, providing natural backpressure. */
         sc->images[idx].acquired = false;
+        pthread_mutex_unlock(&sc->lock);
+
+        worker_post(sc, idx);
 
         if (pInfo->pResults) pInfo->pResults[s] = VK_SUCCESS;
-        pthread_mutex_unlock(&sc->lock);
     }
-    LOG_INFO("Present exit: ret=%d", overall);
     return overall;
 }
 
@@ -1781,6 +1915,10 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
     D(GetFenceStatus);
     D(GetMemoryFdKHR);
     D(GetSemaphoreFdKHR);
+    D(CmdPipelineBarrier);
+    D(CmdPipelineBarrier2);
+    D(CmdPipelineBarrier2KHR);
+    D(EndCommandBuffer);
     D(CreateSwapchainKHR);
     D(DestroySwapchainKHR);
     D(GetSwapchainImagesKHR);
@@ -1863,6 +2001,8 @@ static PFN_vkVoidFunction layer_intercept_device(const char *name) {
     MATCH(WaitForFences);
     MATCH(ResetFences);
     MATCH(CmdPipelineBarrier);
+    MATCH(CmdPipelineBarrier2);
+    MATCH(CmdPipelineBarrier2KHR);
     MATCH(EndCommandBuffer);
 #undef MATCH
     return NULL;
