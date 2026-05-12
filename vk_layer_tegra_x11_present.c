@@ -224,9 +224,8 @@ typedef struct {
     PFN_vkGetMemoryFdKHR         GetMemoryFdKHR;
     PFN_vkGetSemaphoreFdKHR      GetSemaphoreFdKHR;
     PFN_vkCmdPipelineBarrier     CmdPipelineBarrier;
-    PFN_vkCmdPipelineBarrier2    CmdPipelineBarrier2;        /* sync2, core 1.3 */
-    PFN_vkCmdPipelineBarrier2KHR CmdPipelineBarrier2KHR;     /* sync2, KHR variant */
     PFN_vkEndCommandBuffer       EndCommandBuffer;
+    PFN_vkCreateRenderPass       CreateRenderPass;
 
     /* The real WSI calls (we delegate format/presentmode queries to them
        sometimes, but otherwise we replace these completely). */
@@ -1548,54 +1547,61 @@ layer_EndCommandBuffer(VkCommandBuffer cb) {
     return dev->d.EndCommandBuffer(cb);
 }
 
-/* Sync2 (Vulkan 1.3 / VK_KHR_synchronization2) variant of pipeline barriers.
-   Same conceptual rewrite as the original CmdPipelineBarrier — replace
-   PRESENT_SRC_KHR with SHADER_READ_ONLY_OPTIMAL on barriers targeting our
-   managed images. PPSSPP and other modern engines use this path. */
-static void cmd_pipeline_barrier2_impl(VkCommandBuffer cb,
-                                       const VkDependencyInfo *pDependencyInfo,
-                                       PFN_vkCmdPipelineBarrier2 next) {
-    if (!pDependencyInfo || pDependencyInfo->imageMemoryBarrierCount == 0 ||
-        !any_swapchains_tracked()) {
-        next(cb, pDependencyInfo);
-        return;
-    }
-    uint32_t n = pDependencyInfo->imageMemoryBarrierCount;
-    bool any_managed = false;
-    for (uint32_t i = 0; i < n; i++) {
-        if (image_is_managed(pDependencyInfo->pImageMemoryBarriers[i].image)) {
-            any_managed = true; break;
-        }
-    }
-    if (!any_managed) { next(cb, pDependencyInfo); return; }
+/* vkCreateRenderPass intercept.
 
-    VkImageMemoryBarrier2 *fixed = malloc(n * sizeof(*fixed));
-    if (!fixed) { next(cb, pDependencyInfo); return; }
-    memcpy(fixed, pDependencyInfo->pImageMemoryBarriers, n * sizeof(*fixed));
-    for (uint32_t i = 0; i < n; i++) {
-        if (image_is_managed(fixed[i].image)) {
-            fixed[i].oldLayout = fix_layout(fixed[i].oldLayout);
-            fixed[i].newLayout = fix_layout(fixed[i].newLayout);
+   When a render pass's attachment description has finalLayout (or
+   initialLayout) set to PRESENT_SRC_KHR, the driver will perform an implicit
+   layout transition at the end of the render pass execution. For our
+   managed (non-WSI) swapchain images that's the same fault as a manual
+   PRESENT_SRC barrier — the driver tries to invoke present-engine metadata
+   that doesn't exist for externally-allocated images, and faults the GPU.
+
+   Unlike with vkCmdPipelineBarrier, at vkCreateRenderPass time we don't
+   know which images the render pass will be used with — that's determined
+   later by the framebuffer. We pessimistically rewrite ANY PRESENT_SRC
+   attachment layout to SHADER_READ_ONLY_OPTIMAL. This is safe because:
+   - When our layer is active, we replace the swapchain entirely. There are
+     no "real" presentable images in the application; all swapchain images
+     are our managed ones, and they all want SHADER_READ_ONLY_OPTIMAL at
+     present time anyway.
+   - For non-swapchain attachments, applications shouldn't be specifying
+     PRESENT_SRC anyway — that layout only exists for swapchain images.
+     If an app does it incorrectly, our rewrite improves correctness. */
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
+layer_CreateRenderPass(VkDevice device,
+                        const VkRenderPassCreateInfo *pCreateInfo,
+                        const VkAllocationCallbacks *pAllocator,
+                        VkRenderPass *pRenderPass) {
+    DevNode *dev = dev_lookup(dispatch_key(device));
+    if (!dev || !dev->d.CreateRenderPass) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!pCreateInfo || pCreateInfo->attachmentCount == 0)
+        return dev->d.CreateRenderPass(device, pCreateInfo, pAllocator, pRenderPass);
+
+    /* Scan for PRESENT_SRC attachments. */
+    bool any = false;
+    for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
+        VkImageLayout il = pCreateInfo->pAttachments[i].initialLayout;
+        VkImageLayout fl = pCreateInfo->pAttachments[i].finalLayout;
+        if (il == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR || il == VK_IMAGE_LAYOUT_SHARED_PRESENT_KHR ||
+            fl == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR || fl == VK_IMAGE_LAYOUT_SHARED_PRESENT_KHR) {
+            any = true; break;
         }
     }
-    VkDependencyInfo di = *pDependencyInfo;
-    di.pImageMemoryBarriers = fixed;
-    next(cb, &di);
+    if (!any) return dev->d.CreateRenderPass(device, pCreateInfo, pAllocator, pRenderPass);
+
+    VkAttachmentDescription *fixed = malloc(pCreateInfo->attachmentCount * sizeof(*fixed));
+    if (!fixed) return dev->d.CreateRenderPass(device, pCreateInfo, pAllocator, pRenderPass);
+    memcpy(fixed, pCreateInfo->pAttachments,
+           pCreateInfo->attachmentCount * sizeof(*fixed));
+    for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
+        fixed[i].initialLayout = fix_layout(fixed[i].initialLayout);
+        fixed[i].finalLayout   = fix_layout(fixed[i].finalLayout);
+    }
+    VkRenderPassCreateInfo mod = *pCreateInfo;
+    mod.pAttachments = fixed;
+    VkResult r = dev->d.CreateRenderPass(device, &mod, pAllocator, pRenderPass);
     free(fixed);
-}
-
-VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL
-layer_CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo *pDependencyInfo) {
-    DevNode *dev = dev_lookup(dispatch_key(cb));
-    if (!dev || !dev->d.CmdPipelineBarrier2) return;
-    cmd_pipeline_barrier2_impl(cb, pDependencyInfo, dev->d.CmdPipelineBarrier2);
-}
-
-VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL
-layer_CmdPipelineBarrier2KHR(VkCommandBuffer cb, const VkDependencyInfo *pDependencyInfo) {
-    DevNode *dev = dev_lookup(dispatch_key(cb));
-    if (!dev || !dev->d.CmdPipelineBarrier2KHR) return;
-    cmd_pipeline_barrier2_impl(cb, pDependencyInfo, dev->d.CmdPipelineBarrier2KHR);
+    return r;
 }
 
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
@@ -1916,9 +1922,8 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
     D(GetMemoryFdKHR);
     D(GetSemaphoreFdKHR);
     D(CmdPipelineBarrier);
-    D(CmdPipelineBarrier2);
-    D(CmdPipelineBarrier2KHR);
     D(EndCommandBuffer);
+    D(CreateRenderPass);
     D(CreateSwapchainKHR);
     D(DestroySwapchainKHR);
     D(GetSwapchainImagesKHR);
@@ -2001,9 +2006,8 @@ static PFN_vkVoidFunction layer_intercept_device(const char *name) {
     MATCH(WaitForFences);
     MATCH(ResetFences);
     MATCH(CmdPipelineBarrier);
-    MATCH(CmdPipelineBarrier2);
-    MATCH(CmdPipelineBarrier2KHR);
     MATCH(EndCommandBuffer);
+    MATCH(CreateRenderPass);
 #undef MATCH
     return NULL;
 }
