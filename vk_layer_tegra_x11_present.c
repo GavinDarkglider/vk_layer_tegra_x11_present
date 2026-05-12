@@ -121,6 +121,13 @@ static int g_log_level = 1;   /* 0=silent, 1=warn/err, 2=info, 3=debug */
 static FILE *g_log_fp = NULL;
 
 static void layer_log_init(void) {
+    /* X11 threading: must be called before any other Xlib function, otherwise
+       multi-threaded use of Xlib will assert. We use multiple threads (the
+       app's main thread + our worker), each with its own Display* — but Xlib
+       still requires XInitThreads to enable its internal locking. Calling
+       this here, from negotiate-loader, is the earliest reliable point. */
+    XInitThreads();
+
     const char *lvl = getenv("VK_TEGRA_X11_PRESENT_LOG");
     if (lvl) g_log_level = atoi(lvl);
     const char *path = getenv("VK_TEGRA_X11_PRESENT_LOG_FILE");
@@ -387,6 +394,15 @@ typedef struct PerImage {
     GLuint           gl_render_sem;   /* glImportSemaphoreFdEXT of vk_render_done */
     GLuint           gl_sample_sem;   /* glImportSemaphoreFdEXT of gl_sample_done */
 
+    /* Per-image fence: used by vkAcquireNextImageKHR to provide CPU-side
+       backpressure. Without this, Acquire returns immediately and the app's
+       render loop is unblocked by the layer, causing it to spin at maximum
+       framerate while the worker is the one waiting on vsync. With it,
+       Acquire blocks on the fence until our bridge submit (which itself
+       waits on gl_sample_done) completes — same semantic as real WSI
+       Acquire which blocks until a swapchain image is genuinely free. */
+    VkFence          acquire_fence;
+
     /* Tracking the acquire state.
 
        Vulkan's swapchain model says an acquired image is either in the
@@ -436,6 +452,19 @@ typedef struct Swapchain {
     /* The parent X window's actual size, refreshed each present from
        XGetGeometry. We resize the child window to match when it changes. */
     int           win_w, win_h;
+
+    /* Worker's own X Display connection.
+
+       Xlib is not thread-safe to share a single Display* across threads
+       even with XInitThreads — the internal sequencer asserts if two
+       threads make X requests concurrently. Our main thread uses
+       sc->surf->dpy (the surface's Display) for swapchain setup and
+       teardown; the worker thread uses its own dedicated connection
+       (worker_dpy). The Window XID is a server-side ID and can be
+       safely referenced from either connection. The GLX context is also
+       a server-side object and can be made-current on the worker's
+       connection. */
+    Display      *worker_dpy;
 
     /* GL program state for the textured-quad blit */
     GLuint        prog;
@@ -566,12 +595,32 @@ static GLXContext create_glx_context(Display *dpy, GLXFBConfig fbc) {
 /* Worker thread main loop. Owns the GLX context for the swapchain's lifetime;
    the context is made current once at thread start and never released until
    the thread exits. The thread waits on worker_cv_pending for work, processes
-   one frame at a time, and signals worker_cv_done when the slot is free. */
+   one frame at a time, and signals worker_cv_done when the slot is free.
+
+   The worker opens its OWN X Display* connection (sc->worker_dpy) and uses
+   that for all X operations. Sharing an Xlib Display* across threads is
+   unsafe even with XInitThreads — the internal sequencer asserts. By giving
+   the worker its own connection, X requests from both threads are
+   independent. The Window and GLX context are server-side objects and can
+   be referenced from any connection. */
 static void *worker_thread_main(void *arg) {
     Swapchain *sc = (Swapchain *)arg;
 
-    if (!glXMakeCurrent(sc->surf->dpy, sc->child_window, sc->glctx)) {
+    /* Open the worker's own X connection. The Window XID we're going to
+       render into is the same; only the connection differs. */
+    sc->worker_dpy = XOpenDisplay(NULL);
+    if (!sc->worker_dpy) {
+        LOG_ERR("worker_thread_main: XOpenDisplay failed");
+        pthread_mutex_lock(&sc->worker_lock);
+        sc->worker_running = false;
+        pthread_cond_broadcast(&sc->worker_cv_done);
+        pthread_mutex_unlock(&sc->worker_lock);
+        return NULL;
+    }
+
+    if (!glXMakeCurrent(sc->worker_dpy, sc->child_window, sc->glctx)) {
         LOG_ERR("worker_thread_main: glXMakeCurrent failed at startup");
+        XCloseDisplay(sc->worker_dpy); sc->worker_dpy = NULL;
         pthread_mutex_lock(&sc->worker_lock);
         sc->worker_running = false;
         pthread_cond_broadcast(&sc->worker_cv_done);
@@ -584,7 +633,7 @@ static void *worker_thread_main(void *arg) {
         int interval = 1;
         if (sc->present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) interval = 0;
         else if (sc->present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) interval = -1;
-        sc->glXSwapIntervalEXT(sc->surf->dpy, sc->child_window, interval);
+        sc->glXSwapIntervalEXT(sc->worker_dpy, sc->child_window, interval);
     }
 
     int last_win_w = sc->win_w, last_win_h = sc->win_h;
@@ -607,13 +656,14 @@ static void *worker_thread_main(void *arg) {
         pthread_cond_broadcast(&sc->worker_cv_done);
         pthread_mutex_unlock(&sc->worker_lock);
 
-        /* Refresh window size if changed. Cheap when unchanged. */
+        /* Refresh window size if changed. Cheap when unchanged. Use the
+           worker's own Display* for these X calls. */
         uint32_t ww = 0, wh = 0;
         Window root; int wx, wy; unsigned int wb, wd;
-        if (XGetGeometry(sc->surf->dpy, sc->surf->window, &root, &wx, &wy, &ww, &wh, &wb, &wd)) {
+        if (XGetGeometry(sc->worker_dpy, sc->surf->window, &root, &wx, &wy, &ww, &wh, &wb, &wd)) {
             if ((int)ww != last_win_w || (int)wh != last_win_h) {
-                XResizeWindow(sc->surf->dpy, sc->child_window, ww, wh);
-                XFlush(sc->surf->dpy);
+                XResizeWindow(sc->worker_dpy, sc->child_window, ww, wh);
+                XFlush(sc->worker_dpy);
                 last_win_w = (int)ww; last_win_h = (int)wh;
                 glViewport(0, 0, last_win_w, last_win_h);
             }
@@ -637,10 +687,12 @@ static void *worker_thread_main(void *arg) {
         sc->glSignalSemaphoreEXT(sc->images[idx].gl_sample_sem, 0, NULL,
                                  1, &sc->images[idx].gl_texture, dstLayouts);
         glFlush();
-        glXSwapBuffers(sc->surf->dpy, sc->child_window);
+        glXSwapBuffers(sc->worker_dpy, sc->child_window);
     }
 
-    glXMakeCurrent(sc->surf->dpy, None, NULL);
+    glXMakeCurrent(sc->worker_dpy, None, NULL);
+    XCloseDisplay(sc->worker_dpy);
+    sc->worker_dpy = NULL;
 
     pthread_mutex_lock(&sc->worker_lock);
     sc->worker_running = false;
@@ -851,6 +903,16 @@ static VkResult create_exportable_semaphores(DevNode *dev, PerImage *pi) {
     pi->gl_sample_done_fd = -1;
     r = d->GetSemaphoreFdKHR(dev->device, &gfi, &pi->gl_sample_done_fd);
     if (r != VK_SUCCESS || pi->gl_sample_done_fd < 0) goto fail_b;
+
+    /* Per-image acquire fence — used to block Acquire on CPU side until
+       the worker has actually finished sampling this image (which is when
+       gl_sample_done gets re-signaled by the worker's glSignalSemaphoreEXT).
+       Start signaled so the first NIMG acquires don't block. */
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    r = d->CreateFence(dev->device, &fci, NULL, &pi->acquire_fence);
+    if (r != VK_SUCCESS) goto fail_b;
+
     return VK_SUCCESS;
 
 fail_b:
@@ -920,6 +982,7 @@ static void destroy_perimage(DevNode *dev, Swapchain *sc, PerImage *pi) {
 
     if (pi->vk_render_done) d->DestroySemaphore(dev->device, pi->vk_render_done, NULL);
     if (pi->gl_sample_done) d->DestroySemaphore(dev->device, pi->gl_sample_done, NULL);
+    if (pi->acquire_fence)  d->DestroyFence    (dev->device, pi->acquire_fence, NULL);
     if (pi->image)          d->DestroyImage    (dev->device, pi->image, NULL);
     if (pi->memory)         d->FreeMemory      (dev->device, pi->memory, NULL);
 
@@ -1355,7 +1418,7 @@ layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
     if (!sc) return dev->d.AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pIndex);
 
     pthread_mutex_lock(&sc->lock);
-    /* Find the next free image. Round-robin among in_flight==false images. */
+    /* Find the next free image. Round-robin among acquired==false images. */
     uint32_t idx = sc->next_acquire;
     uint32_t tried = 0;
     while (tried < sc->image_count && sc->images[idx].acquired) {
@@ -1369,25 +1432,51 @@ layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
     sc->images[idx].acquired = true;
     sc->next_acquire = (idx + 1) % sc->image_count;
 
+    /* Reset our internal acquire_fence (it was either signaled-at-creation
+       for the first N acquires, or signaled by the previous bridge submit). */
+    dev->d.ResetFences(dev->device, 1, &sc->images[idx].acquire_fence);
+
     /* Bridge submit: wait on the per-image gl_sample_done semaphore, signal
-       the app's requested acquire semaphore and/or fence. The wait ensures
-       the app doesn't get to render into images[idx] before GL has finished
-       sampling it. */
+       the app's requested acquire semaphore and/or fence, AND signal our
+       internal acquire_fence. The fence lets us CPU-block here until the
+       worker has actually finished sampling the image, which is the real
+       backpressure point: without this, the app's loop runs unbounded
+       (matching the worker's vsync rate) and burns CPU. */
     VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.waitSemaphoreCount   = 1;
     si.pWaitSemaphores      = &sc->images[idx].gl_sample_done;
     si.pWaitDstStageMask    = &stage;
     if (semaphore) { si.signalSemaphoreCount = 1; si.pSignalSemaphores = &semaphore; }
-    VkResult r = dev->d.QueueSubmit(dev->graphics_queue, 1, &si, fence);
+    VkResult r = dev->d.QueueSubmit(dev->graphics_queue, 1, &si, sc->images[idx].acquire_fence);
     pthread_mutex_unlock(&sc->lock);
     if (r != VK_SUCCESS) {
-        LOG_ERR("AcquireNextImageKHR: bridge QueueSubmit failed: %d (queue=%p sem=%p fence=%p signal=%p)",
-                r, (void*)dev->graphics_queue, (void*)semaphore, (void*)fence, (void*)sc->images[idx].gl_sample_done);
+        LOG_ERR("AcquireNextImageKHR: bridge QueueSubmit failed: %d", r);
         return r;
     }
-    LOG_DBG("Acquire -> idx=%u (bridge submit ok, signal app_sem=%p fence=%p)",
-            idx, (void*)semaphore, (void*)fence);
+
+    /* CPU-block until our internal fence signals. This is the backpressure
+       point that makes the app's render loop track the worker's actual
+       framerate instead of running unbounded. We use the app's requested
+       timeout to honor its expectations; if the app passed UINT64_MAX (the
+       common case) we'll wait as long as needed. */
+    r = dev->d.WaitForFences(dev->device, 1, &sc->images[idx].acquire_fence, VK_TRUE, timeout);
+    if (r == VK_TIMEOUT) return VK_TIMEOUT;
+    if (r != VK_SUCCESS) {
+        LOG_ERR("AcquireNextImageKHR: WaitForFences failed: %d", r);
+        return r;
+    }
+
+    /* If the app passed its OWN fence (separate from our internal one), we
+       need to also signal it. Easiest: do a second tiny submit that signals
+       just the app's fence. Skip if no app fence. */
+    if (fence) {
+        VkSubmitInfo si2 = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        r = dev->d.QueueSubmit(dev->graphics_queue, 1, &si2, fence);
+        if (r != VK_SUCCESS) {
+            LOG_ERR("AcquireNextImageKHR: app-fence signal submit failed: %d", r);
+        }
+    }
 
     *pIndex = idx;
     return VK_SUCCESS;
