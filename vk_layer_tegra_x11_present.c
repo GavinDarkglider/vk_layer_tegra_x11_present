@@ -202,6 +202,18 @@ typedef struct {
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR        GetPhysicalDeviceSurfaceFormatsKHR;
     PFN_vkGetPhysicalDeviceSurfacePresentModesKHR   GetPhysicalDeviceSurfacePresentModesKHR;
 
+    /* VK_KHR_get_surface_capabilities2 — newer "2" variants that take an
+       extensible chain instead of plain output structs. PPSSPP and several
+       other modern Vulkan apps prefer these. We have to intercept them too;
+       otherwise the underlying driver answers based on its own (broken) WSI
+       state, and the app gets a surface capabilities object that doesn't
+       match what we report for the v1 variants. The result is the app
+       configuring its swapchain for one set of capabilities and then trying
+       to use it against a different set — typically a NULL deref on the
+       framebuffer/image-view chain that depends on the mismatched format. */
+    PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR  GetPhysicalDeviceSurfaceCapabilities2KHR;
+    PFN_vkGetPhysicalDeviceSurfaceFormats2KHR       GetPhysicalDeviceSurfaceFormats2KHR;
+
     PFN_vkGetPhysicalDeviceImageFormatProperties2 GetPhysicalDeviceImageFormatProperties2;
     PFN_vkGetPhysicalDeviceExternalSemaphoreProperties GetPhysicalDeviceExternalSemaphoreProperties;
 } InstanceDispatch;
@@ -639,6 +651,17 @@ static void *worker_thread_main(void *arg) {
     int last_win_w = sc->win_w, last_win_h = sc->win_h;
     glViewport(0, 0, last_win_w, last_win_h);
 
+    /* Simple frame-timing diagnostic: every 60 frames, log the average
+       inter-frame interval. If glXSwapBuffers is actually blocking on vsync,
+       this should be ~16667 us. If it's not blocking, it'll be much less
+       (and CPU will spike). */
+    uint64_t frame_count = 0;
+    uint64_t window_start_us = 0;
+    {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        window_start_us = (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
+    }
+
     for (;;) {
         /* Wait for work or shutdown. */
         pthread_mutex_lock(&sc->worker_lock);
@@ -688,6 +711,16 @@ static void *worker_thread_main(void *arg) {
                                  1, &sc->images[idx].gl_texture, dstLayouts);
         glFlush();
         glXSwapBuffers(sc->worker_dpy, sc->child_window);
+
+        frame_count++;
+        if ((frame_count % 60) == 0) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
+            uint64_t elapsed = now_us - window_start_us;
+            LOG_INFO("worker: 60 frames in %" PRIu64 " us (%.1f us/frame, target 16667)",
+                     elapsed, elapsed / 60.0);
+            window_start_us = now_us;
+        }
     }
 
     glXMakeCurrent(sc->worker_dpy, None, NULL);
@@ -1175,6 +1208,61 @@ layer_GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice physicalDevice,
     if (!pModes) { *pCount = avail; return VK_SUCCESS; }
     uint32_t n = *pCount < avail ? *pCount : avail;
     memcpy(pModes, modes, n * sizeof(VkPresentModeKHR));
+    *pCount = n;
+    return n == avail ? VK_SUCCESS : VK_INCOMPLETE;
+}
+
+/* VK_KHR_get_surface_capabilities2 — the "2" variants take a chain-extensible
+   input struct (VkPhysicalDeviceSurfaceInfo2KHR) and write into a chain-extensible
+   output. For our purposes we just delegate to the v1 implementation for our
+   managed surfaces; we ignore any unknown pNext extensions on either side.
+   For non-managed surfaces we pass through to the underlying driver. */
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
+layer_GetPhysicalDeviceSurfaceCapabilities2KHR(VkPhysicalDevice physicalDevice,
+                                                const VkPhysicalDeviceSurfaceInfo2KHR *pSurfaceInfo,
+                                                VkSurfaceCapabilities2KHR *pCaps) {
+    if (!pSurfaceInfo || !pCaps) return VK_ERROR_VALIDATION_FAILED_EXT;
+    Surface *s = as_surface(pSurfaceInfo->surface);
+    InstNode *in = inst_lookup(dispatch_key(physicalDevice));
+    if (!s) {
+        if (in && in->d.GetPhysicalDeviceSurfaceCapabilities2KHR)
+            return in->d.GetPhysicalDeviceSurfaceCapabilities2KHR(physicalDevice, pSurfaceInfo, pCaps);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    /* Delegate to v1 for the core surfaceCapabilities. */
+    return layer_GetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice,
+                                                         pSurfaceInfo->surface,
+                                                         &pCaps->surfaceCapabilities);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
+layer_GetPhysicalDeviceSurfaceFormats2KHR(VkPhysicalDevice physicalDevice,
+                                           const VkPhysicalDeviceSurfaceInfo2KHR *pSurfaceInfo,
+                                           uint32_t *pCount,
+                                           VkSurfaceFormat2KHR *pFormats) {
+    if (!pSurfaceInfo) return VK_ERROR_VALIDATION_FAILED_EXT;
+    Surface *s = as_surface(pSurfaceInfo->surface);
+    InstNode *in = inst_lookup(dispatch_key(physicalDevice));
+    if (!s) {
+        if (in && in->d.GetPhysicalDeviceSurfaceFormats2KHR)
+            return in->d.GetPhysicalDeviceSurfaceFormats2KHR(physicalDevice, pSurfaceInfo, pCount, pFormats);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    /* Get the v1 formats, then wrap each into a VkSurfaceFormat2KHR. */
+    static const VkSurfaceFormatKHR formats[] = {
+        { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
+        { VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
+        { VK_FORMAT_B8G8R8A8_SRGB,  VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
+        { VK_FORMAT_R8G8B8A8_SRGB,  VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
+    };
+    uint32_t avail = sizeof(formats) / sizeof(formats[0]);
+    if (!pFormats) { *pCount = avail; return VK_SUCCESS; }
+    uint32_t n = *pCount < avail ? *pCount : avail;
+    for (uint32_t i = 0; i < n; i++) {
+        pFormats[i].sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR;
+        pFormats[i].pNext = NULL;
+        pFormats[i].surfaceFormat = formats[i];
+    }
     *pCount = n;
     return n == avail ? VK_SUCCESS : VK_INCOMPLETE;
 }
@@ -1890,6 +1978,8 @@ layer_CreateInstance(const VkInstanceCreateInfo *ci,
     I(GetPhysicalDeviceSurfaceCapabilitiesKHR);
     I(GetPhysicalDeviceSurfaceFormatsKHR);
     I(GetPhysicalDeviceSurfacePresentModesKHR);
+    I(GetPhysicalDeviceSurfaceCapabilities2KHR);
+    I(GetPhysicalDeviceSurfaceFormats2KHR);
     I(GetPhysicalDeviceImageFormatProperties2);
     I(GetPhysicalDeviceExternalSemaphoreProperties);
 #undef I
@@ -2076,6 +2166,8 @@ static PFN_vkVoidFunction layer_intercept_instance(const char *name) {
     MATCH(GetPhysicalDeviceSurfaceCapabilitiesKHR);
     MATCH(GetPhysicalDeviceSurfaceFormatsKHR);
     MATCH(GetPhysicalDeviceSurfacePresentModesKHR);
+    MATCH(GetPhysicalDeviceSurfaceCapabilities2KHR);
+    MATCH(GetPhysicalDeviceSurfaceFormats2KHR);
 #undef MATCH
     return NULL;
 }
