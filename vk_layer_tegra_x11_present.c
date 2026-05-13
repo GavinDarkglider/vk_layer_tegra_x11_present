@@ -1543,12 +1543,18 @@ layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
         return r;
     }
 
-    /* CPU-block until our internal fence signals. This is the backpressure
-       point that makes the app's render loop track the worker's actual
-       framerate instead of running unbounded. We use the app's requested
-       timeout to honor its expectations; if the app passed UINT64_MAX (the
-       common case) we'll wait as long as needed. */
+    /* CPU-block until our internal fence signals. */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     r = dev->d.WaitForFences(dev->device, 1, &sc->images[idx].acquire_fence, VK_TRUE, timeout);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t wait_us = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000ULL +
+                       (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000ULL;
+    /* Log every 60th acquire to avoid spam. */
+    static uint64_t acq_count = 0;
+    if ((++acq_count % 60) == 0) {
+        LOG_INFO("Acquire: average over 60 acquires, last wait %" PRIu64 " us (expected ~16667 if vsync-paced)", wait_us);
+    }
     if (r == VK_TIMEOUT) return VK_TIMEOUT;
     if (r != VK_SUCCESS) {
         LOG_ERR("AcquireNextImageKHR: WaitForFences failed: %d", r);
