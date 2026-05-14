@@ -74,26 +74,67 @@ For each swapchain image (N images per swapchain, configurable 2–8):
 
 4. **Acquire** (`vkAcquireNextImageKHR`):
    - Picks the next free image index (round-robin).
-   - Issues a wait-only Vulkan submit: wait on `gl_sample_done[i]`, signal
-     the application's requested acquire semaphore and/or fence.
+   - Issues a bridge Vulkan submit: wait on `gl_sample_done[i]`, signal the
+     application's requested acquire semaphore, signal our internal per-image
+     fence.
+   - CPU-blocks on the internal fence with `vkWaitForFences`. This is the
+     backpressure point — the call returns only when GL has actually
+     finished sampling the image, which paces the application to the real
+     presentation rate.
    - Returns the index.
 
 5. **Present** (`vkQueuePresentKHR`):
-   - Issues a signal-only Vulkan bridge submit: wait on the application's
-     present-time wait semaphores, signal `vk_render_done[i]`.
-   - Makes the GLX context current on the calling thread.
-   - Calls `glWaitSemaphoreEXT` on the GL view of `vk_render_done[i]`,
-     specifying the image's GL texture in `SHADER_READ_ONLY` layout.
-   - Draws a textured quad sampling the image into the GLX back buffer at
-     the window's current geometry.
-   - Calls `glSignalSemaphoreEXT` on the GL view of `gl_sample_done[i]`,
-     `glFlush`, then `glXSwapBuffers`.
-   - Releases the GLX context.
+   - Issues a Vulkan bridge submit: wait on the application's present-time
+     wait semaphores, signal `vk_render_done[i]`.
+   - Posts the image index to the swapchain's worker thread via a single-slot
+     queue. If the worker is still processing the previous frame, the post
+     blocks; otherwise it returns immediately.
+   - Returns to the application.
 
-The cost per present is two empty Vulkan submits and a single textured-quad
-draw, plus `glXMakeCurrent`/`glXMakeCurrent(None)`. Measured pacing on Tegra
-X1 over 600 frames: mean inter-frame 16,678 µs, stddev 879 µs, p99 18,359 µs
-— a clean 60 Hz vsync lock.
+6. **Worker thread** (one per swapchain, lifetime-pinned to swapchain):
+   - Owns the GLX context for the swapchain's entire lifetime. The context
+     is made current at thread start and never released until the worker
+     exits. This eliminates per-frame `glXMakeCurrent` overhead and isolates
+     `glXSwapBuffers`'s vsync wait from the application's render thread.
+   - Opens its own X `Display*` connection. Xlib is not thread-safe to
+     share even with `XInitThreads`; the main thread and the worker need
+     separate connections.
+   - Loop: wait for a posted image index, refresh window geometry if the
+     parent window resized, `glWaitSemaphoreEXT(vk_render_done[i])`,
+     blit textured quad, `glSignalSemaphoreEXT(gl_sample_done[i])`,
+     `glXSwapBuffers`. Then mark the slot free.
+
+The cost per present is two Vulkan submits and a single textured-quad
+draw. The application's render thread is paced by `vkAcquireNextImageKHR`'s
+fence wait; the worker thread is paced by `glXSwapBuffers`'s vsync wait.
+Measured pacing on Tegra X1: clean 60 Hz lock.
+
+## NVIDIA driver environment
+
+On Tegra L4T r32.x, NVIDIA's GLX implementation does `glXSwapBuffers`'s
+vsync wait as a `sched_yield()` loop instead of a kernel sleep. The thread
+running `glXSwapBuffers` therefore shows up at ~100% CPU in tools like
+`top` even when the actual work is trivial.
+
+To work around this, the layer sets `__GL_YIELD=USLEEP` in its `.so`
+constructor, before the application has had a chance to load `libGL`. This
+tells NVIDIA's driver to insert `usleep(1)` between vblank checks, which
+drops measured CPU usage on the worker thread to single digits while
+preserving vsync accuracy.
+
+If your launch environment overrides `__GL_YIELD` to something else,
+that wins (the constructor uses `setenv(..., 0)` which doesn't overwrite).
+On modern desktop NVIDIA drivers, `__GL_YIELD="nothing"` is the better
+choice; on Tegra L4T r32.x specifically it is not — the driver still
+spins. `USLEEP` is the right value for this driver vintage.
+
+If for some reason the constructor runs too late (the layer is loaded
+after `libGL` has already initialized), set `__GL_YIELD=USLEEP` in your
+launch script before invoking the application:
+
+```sh
+__GL_YIELD=USLEEP retroarch
+```
 
 ## Compositor coexistence
 
@@ -174,14 +215,17 @@ should be locked to the display refresh rate.
 | `VK_TEGRA_X11_PRESENT_DISABLE=1` | Passthrough mode. The layer loads but forwards every call unmodified to the next layer / ICD. Useful for A/B comparison against the broken native WSI. |
 | `VK_TEGRA_X11_PRESENT_LOG=N` | Log verbosity: 0=silent, 1=warn/err (default), 2=info, 3=debug. |
 | `VK_TEGRA_X11_PRESENT_LOG_FILE=PATH` | Append logs to `PATH` in addition to stderr. |
+| `VK_TEGRA_X11_PRESENT_DIAG=1` | Diagnostic mode. After every `vkQueueSubmit`, the layer calls `vkDeviceWaitIdle` and reports if the GPU faulted on that submit. Catastrophically slow (every submit becomes synchronous), useful only for one-shot fault localization. |
+| `__GL_YIELD=USLEEP` | NVIDIA driver env var. Auto-set by the layer's `.so` constructor; document here for awareness. See "NVIDIA driver environment" above. |
 
 ## Limitations and known issues
 
-- **Single-thread present.** The layer makes the GLX context current on
-  the thread that calls `vkQueuePresentKHR`. Multi-threaded apps that
-  present from different threads on the same swapchain will see a warning
-  and may experience extra serialization. RetroArch and similar
-  single-threaded render loops are unaffected.
+- **Vulkan queue serialization.** The application's `vkQueueSubmit` and
+  the layer's internal bridge submits are serialized through a per-device
+  mutex. This is required by the Vulkan spec (external synchronization on
+  the queue) and matters when the application uses a separate render
+  thread (PPSSPP, Citra, etc.). The cost is negligible: a mutex acquire
+  per submit. Apps that only submit from one thread pay nothing.
 
 - **Image format restrictions.** The application's swapchain format must
   be one of `VK_FORMAT_B8G8R8A8_UNORM`, `VK_FORMAT_R8G8B8A8_UNORM`,

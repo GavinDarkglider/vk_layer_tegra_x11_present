@@ -127,6 +127,29 @@ static FILE *g_log_fp = NULL;
    and is only meant for one-shot fault localization. */
 static bool g_diag_wait_after_submit = false;
 
+/* Runs at .so load time, before the application has had a chance to load
+   libGL or read any Nvidia-driver env vars. This is the only point at which
+   we can reliably affect __GL_YIELD: setting it from vkNegotiateLoader is
+   too late, because libGL has already been loaded by then and Nvidia's
+   driver caches the env value at library init.
+
+   Implicit Vulkan layers are loaded by the Vulkan loader at vkCreateInstance.
+   For RetroArch, that's after libretro core init but before any GL setup, so
+   our constructor fires in time. For purely GLX apps (vkcube doesn't apply
+   but the layer is harmless for them; non-Vulkan apps wouldn't load us),
+   this code never runs because the loader never loads us.
+
+   The "0" final arg to setenv means "don't overwrite if already set" — an
+   application or user override wins.
+
+   See the explanation in vkNegotiateLoaderLayerInterfaceVersion for why
+   USLEEP specifically (and not "nothing" as KWin recommends on modern
+   drivers) is what works on Tegra L4T r32.x. */
+__attribute__((constructor))
+static void layer_early_init(void) {
+    setenv("__GL_YIELD", "USLEEP", 0);
+}
+
 static void layer_log_init(void) {
     /* X11 threading: must be called before any other Xlib function, otherwise
        multi-threaded use of Xlib will assert. We use multiple threads (the
@@ -310,6 +333,7 @@ typedef struct DevNode {
        a few ns. The point is that no submit from any source happens
        concurrently with another. */
     pthread_mutex_t submit_lock;
+    int             submit_inflight;  /* DEBUG: should always be 0 or 1 */
     struct DevNode *next;
 } DevNode;
 static DevNode *g_dev_table[HASH_BUCKETS];
@@ -384,13 +408,34 @@ static void dev_remove(void *key) {
 
 /* Serialized queue submit. Acquires dev->submit_lock, calls the driver's
    QueueSubmit, releases. This is the ONLY way our layer touches the queue —
-   the app's submits go through layer_QueueSubmit which uses the same lock. */
+   the app's submits go through layer_QueueSubmit which uses the same lock.
+
+   The Vulkan spec requires external synchronization on the queue parameter
+   to vkQueueSubmit: the application must ensure only one thread submits to
+   a given queue at a time. We have to provide that synchronization for
+   our own bridge submits AND for the app's submits going through our
+   wrapper, because the app's render thread and our Acquire/Present can
+   both end up on the same VkQueue. */
 static VkResult queue_submit_locked(DevNode *dev, VkQueue queue,
                                     uint32_t submitCount,
                                     const VkSubmitInfo *pSubmits,
                                     VkFence fence) {
     pthread_mutex_lock(&dev->submit_lock);
+#ifndef NDEBUG
+    /* Sanity check: with the mutex held, exactly one thread should be in
+       the critical section at a time. If this ever exceeds 1 the lock is
+       broken. Production builds skip this check. */
+    int n = __atomic_add_fetch(&dev->submit_inflight, 1, __ATOMIC_SEQ_CST);
+    if (n != 1) {
+        LOG_ERR("queue_submit_locked: %d threads inside lock simultaneously! "
+                "(self=%lu queue=%p)",
+                n, (unsigned long)pthread_self(), (void*)queue);
+    }
+#endif
     VkResult r = dev->d.QueueSubmit(queue, submitCount, pSubmits, fence);
+#ifndef NDEBUG
+    __atomic_sub_fetch(&dev->submit_inflight, 1, __ATOMIC_SEQ_CST);
+#endif
     pthread_mutex_unlock(&dev->submit_lock);
     return r;
 }
@@ -698,17 +743,6 @@ static void *worker_thread_main(void *arg) {
     int last_win_w = sc->win_w, last_win_h = sc->win_h;
     glViewport(0, 0, last_win_w, last_win_h);
 
-    /* Simple frame-timing diagnostic: every 60 frames, log the average
-       inter-frame interval. If glXSwapBuffers is actually blocking on vsync,
-       this should be ~16667 us. If it's not blocking, it'll be much less
-       (and CPU will spike). */
-    uint64_t frame_count = 0;
-    uint64_t window_start_us = 0;
-    {
-        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-        window_start_us = (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
-    }
-
     for (;;) {
         /* Wait for work or shutdown. */
         pthread_mutex_lock(&sc->worker_lock);
@@ -762,16 +796,6 @@ static void *worker_thread_main(void *arg) {
         sc->worker_pending = false;
         pthread_cond_broadcast(&sc->worker_cv_done);
         pthread_mutex_unlock(&sc->worker_lock);
-
-        frame_count++;
-        if ((frame_count % 60) == 0) {
-            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
-            uint64_t elapsed = now_us - window_start_us;
-            LOG_INFO("worker: 60 frames in %" PRIu64 " us (%.1f us/frame, target 16667)",
-                     elapsed, elapsed / 60.0);
-            window_start_us = now_us;
-        }
     }
 
     glXMakeCurrent(sc->worker_dpy, None, NULL);
@@ -1626,18 +1650,9 @@ layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
         return r;
     }
 
-    /* CPU-block until our internal fence signals. */
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    /* CPU-block until our internal fence signals. This is the backpressure
+       point that paces the app's render loop to actual presentation rate. */
     r = dev->d.WaitForFences(dev->device, 1, &sc->images[idx].acquire_fence, VK_TRUE, timeout);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    uint64_t wait_us = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000ULL +
-                       (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000ULL;
-    /* Log every 60th acquire to avoid spam. */
-    static uint64_t acq_count = 0;
-    if ((++acq_count % 60) == 0) {
-        LOG_INFO("Acquire: average over 60 acquires, last wait %" PRIu64 " us (expected ~16667 if vsync-paced)", wait_us);
-    }
     if (r == VK_TIMEOUT) return VK_TIMEOUT;
     if (r != VK_SUCCESS) {
         LOG_ERR("AcquireNextImageKHR: WaitForFences failed: %d", r);
@@ -1795,13 +1810,8 @@ layer_CmdPipelineBarrier(VkCommandBuffer cb,
     memcpy(fixed, imgBarriers, imgBarrierCount * sizeof(*fixed));
     for (uint32_t i = 0; i < imgBarrierCount; i++) {
         if (image_is_managed(fixed[i].image)) {
-            VkImageLayout o = fixed[i].oldLayout, n = fixed[i].newLayout;
-            fixed[i].oldLayout = fix_layout(o);
-            fixed[i].newLayout = fix_layout(n);
-            if (o != fixed[i].oldLayout || n != fixed[i].newLayout) {
-                LOG_INFO("CmdPipelineBarrier rewrite: img=%p old %d->%d new %d->%d",
-                         (void*)fixed[i].image, o, fixed[i].oldLayout, n, fixed[i].newLayout);
-            }
+            fixed[i].oldLayout = fix_layout(fixed[i].oldLayout);
+            fixed[i].newLayout = fix_layout(fixed[i].newLayout);
         }
     }
     dev->d.CmdPipelineBarrier(cb, srcStage, dstStage, depFlags,
@@ -1865,13 +1875,8 @@ layer_CreateRenderPass(VkDevice device,
     memcpy(fixed, pCreateInfo->pAttachments,
            pCreateInfo->attachmentCount * sizeof(*fixed));
     for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
-        VkImageLayout oi = fixed[i].initialLayout, of = fixed[i].finalLayout;
         fixed[i].initialLayout = fix_layout(fixed[i].initialLayout);
         fixed[i].finalLayout   = fix_layout(fixed[i].finalLayout);
-        if (oi != fixed[i].initialLayout || of != fixed[i].finalLayout) {
-            LOG_INFO("CreateRenderPass rewrite: attachment %u init %d->%d final %d->%d",
-                     i, oi, fixed[i].initialLayout, of, fixed[i].finalLayout);
-        }
     }
     VkRenderPassCreateInfo mod = *pCreateInfo;
     mod.pAttachments = fixed;
