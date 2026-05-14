@@ -294,6 +294,22 @@ typedef struct DevNode {
     VkPhysicalDeviceMemoryProperties memp;
     uint32_t graphics_qfi;
     VkQueue graphics_queue;      /* lazy-resolved */
+    /* Queue submit serialization.
+
+       VkQueue is "externally synchronized" — per the Vulkan spec, only one
+       thread may call vkQueueSubmit on a given queue at a time. The app is
+       responsible for that mutex, but our layer's own bridge submits in
+       Acquire/Present also touch the queue. If the app has a separate render
+       thread (PPSSPP does) that submits concurrently with our bridge, the
+       Nvidia Tegra driver hits an internal race and the GPU faults — observed
+       as DEVICE_LOST on subsequent submits.
+
+       We serialize on a per-device mutex covering ALL submits — ours and the
+       app's (through our layer_QueueSubmit wrapper). The app may have its
+       own mutex too; that's fine, double-locking a single submit costs only
+       a few ns. The point is that no submit from any source happens
+       concurrently with another. */
+    pthread_mutex_t submit_lock;
     struct DevNode *next;
 } DevNode;
 static DevNode *g_dev_table[HASH_BUCKETS];
@@ -365,6 +381,19 @@ static void dev_remove(void *key) {
 
 /* For queue->device lookup. Vulkan queues are dispatchable; their key is the
    parent device's. */
+
+/* Serialized queue submit. Acquires dev->submit_lock, calls the driver's
+   QueueSubmit, releases. This is the ONLY way our layer touches the queue —
+   the app's submits go through layer_QueueSubmit which uses the same lock. */
+static VkResult queue_submit_locked(DevNode *dev, VkQueue queue,
+                                    uint32_t submitCount,
+                                    const VkSubmitInfo *pSubmits,
+                                    VkFence fence) {
+    pthread_mutex_lock(&dev->submit_lock);
+    VkResult r = dev->d.QueueSubmit(queue, submitCount, pSubmits, fence);
+    pthread_mutex_unlock(&dev->submit_lock);
+    return r;
+}
 
 /* ----------------------------------------------------------------------- */
 /* Surfaces                                                                */
@@ -1447,7 +1476,7 @@ layer_CreateSwapchainKHR(VkDevice device,
         VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &sc->images[i].gl_sample_done;
-        VkResult psr = dev->d.QueueSubmit(dev->graphics_queue, 1, &si, VK_NULL_HANDLE);
+        VkResult psr = queue_submit_locked(dev, dev->graphics_queue, 1, &si, VK_NULL_HANDLE);
         if (psr != VK_SUCCESS) {
             LOG_ERR("pre-signal QueueSubmit for image %u failed: %d", i, psr);
             goto fail_perimg;
@@ -1590,7 +1619,7 @@ layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
     si.pWaitSemaphores      = &sc->images[idx].gl_sample_done;
     si.pWaitDstStageMask    = &stage;
     if (semaphore) { si.signalSemaphoreCount = 1; si.pSignalSemaphores = &semaphore; }
-    VkResult r = dev->d.QueueSubmit(dev->graphics_queue, 1, &si, sc->images[idx].acquire_fence);
+    VkResult r = queue_submit_locked(dev, dev->graphics_queue, 1, &si, sc->images[idx].acquire_fence);
     pthread_mutex_unlock(&sc->lock);
     if (r != VK_SUCCESS) {
         LOG_ERR("AcquireNextImageKHR: bridge QueueSubmit failed: %d", r);
@@ -1620,7 +1649,7 @@ layer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
        just the app's fence. Skip if no app fence. */
     if (fence) {
         VkSubmitInfo si2 = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-        r = dev->d.QueueSubmit(dev->graphics_queue, 1, &si2, fence);
+        r = queue_submit_locked(dev, dev->graphics_queue, 1, &si2, fence);
         if (r != VK_SUCCESS) {
             LOG_ERR("AcquireNextImageKHR: app-fence signal submit failed: %d", r);
         }
@@ -1867,7 +1896,7 @@ layer_QueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSubm
                  pSubmits[0].signalSemaphoreCount);
     }
 
-    VkResult r = dev->d.QueueSubmit(queue, submitCount, pSubmits, fence);
+    VkResult r = queue_submit_locked(dev, queue, submitCount, pSubmits, fence);
     if (r != VK_SUCCESS) {
         LOG_ERR("vkQueueSubmit FAILED at seq#%" PRIu64 ": ret=%d queue=%p submitCount=%u fence=%p",
                 my_seq, r, (void*)queue, submitCount, (void*)fence);
@@ -1919,7 +1948,12 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
     /* Queue's dispatch key is the parent device's. */
     DevNode *dev = dev_lookup(dispatch_key(queue));
     if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
-    if (g_layer_disabled) return dev->d.QueuePresentKHR(queue, pInfo);
+    if (g_layer_disabled) {
+        pthread_mutex_lock(&dev->submit_lock);
+        VkResult r = dev->d.QueuePresentKHR(queue, pInfo);
+        pthread_mutex_unlock(&dev->submit_lock);
+        return r;
+    }
 
     LOG_DBG("Present entry: queue=%p (graphics_queue=%p) swapchains=%u waitSems=%u",
              (void*)queue, (void*)dev->graphics_queue,
@@ -1938,7 +1972,9 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
             sub.pResults       = pInfo->pResults ? &pInfo->pResults[s] : NULL;
             sub.waitSemaphoreCount = (s == 0) ? pInfo->waitSemaphoreCount : 0;
             sub.pWaitSemaphores    = (s == 0) ? pInfo->pWaitSemaphores    : NULL;
+            pthread_mutex_lock(&dev->submit_lock);
             VkResult r = dev->d.QueuePresentKHR(queue, &sub);
+            pthread_mutex_unlock(&dev->submit_lock);
             if (pInfo->pResults) pInfo->pResults[s] = r;
             if (r != VK_SUCCESS && overall == VK_SUCCESS) overall = r;
             continue;
@@ -1967,7 +2003,7 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
         }
         bridge.signalSemaphoreCount = 1;
         bridge.pSignalSemaphores = &sc->images[idx].vk_render_done;
-        VkResult rb = dev->d.QueueSubmit(queue, 1, &bridge, VK_NULL_HANDLE);
+        VkResult rb = queue_submit_locked(dev, queue, 1, &bridge, VK_NULL_HANDLE);
         if (rb != VK_SUCCESS) {
             pthread_mutex_unlock(&sc->lock);
             LOG_ERR("QueuePresentKHR: bridge QueueSubmit failed: %d (queue=%p idx=%u waitSems=%u signal=%p)",
@@ -2229,6 +2265,7 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
         if (qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { node->graphics_qfi = i; break; }
     free(qfs);
     node->d.GetDeviceQueue(*pDev, node->graphics_qfi, 0, &node->graphics_queue);
+    pthread_mutex_init(&node->submit_lock, NULL);
 
     dev_insert(node);
     LOG_INFO("CreateDevice: dev=%p qfi=%u", *pDev, node->graphics_qfi);
@@ -2240,6 +2277,7 @@ layer_DestroyDevice(VkDevice dev, const VkAllocationCallbacks *pAlloc) {
     DevNode *node = dev_lookup(dispatch_key(dev));
     if (!node) return;
     node->d.DestroyDevice(dev, pAlloc);
+    pthread_mutex_destroy(&node->submit_lock);
     dev_remove(dispatch_key(dev));
 }
 
@@ -2337,30 +2375,21 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pInterface) {
        though the actual work is trivial — it's all spent in sched_yield
        between vblank checks.
 
-       KWin (the KDE X11 compositor) solved this exact problem years ago with
-       two Nvidia-specific env vars:
+       KWin (the KDE X11 compositor) handles this on modern Nvidia drivers
+       with __GL_YIELD="nothing" + __GL_MaxFramesAllowed=1 — the idea being
+       to let glXSwapBuffers genuinely block instead of spinning. That combo
+       does NOT work on r32.x: empirically the thread still pegs CPU. The
+       r32.x driver doesn't actually do a kernel sleep on swap; it always
+       spins. Without a yield, it spins even harder.
 
-         __GL_YIELD="nothing"    — Nvidia falls back to pthread_yield instead
-                                   of sched_yield. Combined with the queue-depth
-                                   limit below, this means the thread blocks on
-                                   real driver work instead of spinning.
-
-         __GL_MaxFramesAllowed=1 — Cap the driver's internal frame queue at 1.
-                                   Without this, the driver queues multiple
-                                   frames ahead, so glXSwapBuffers returns
-                                   quickly (the swap is queued) and the vsync
-                                   wait happens elsewhere as a spin. With queue
-                                   depth 1, glXSwapBuffers actually blocks until
-                                   the previous frame has presented — which on
-                                   Nvidia's path is a kernel wait, not a spin.
-
-       The pair works together. Setting only one gives modest improvement;
-       both together is what gets the worker thread to sleep properly.
+       What does work on r32.x is __GL_YIELD="USLEEP". That tells Nvidia to
+       insert usleep(1) between iterations of the yield loop, which is enough
+       to keep the kernel from scheduling the thread at full priority and
+       drops measured CPU to single digits while preserving vsync accuracy.
 
        The "0" final arg means "don't overwrite if already set" — application
        or user env wins. */
-    setenv("__GL_YIELD",            "nothing", 0);
-    setenv("__GL_MaxFramesAllowed", "1",       0);
+    setenv("__GL_YIELD", "USLEEP", 0);
 
     /* Loud one-time banner so a tester running an older cached binary can spot
        the version mismatch immediately. Bump when the layer's behaviour changes. */
