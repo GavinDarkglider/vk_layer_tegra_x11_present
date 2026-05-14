@@ -962,6 +962,16 @@ static bool gl_import_image(Swapchain *sc, PerImage *pi) {
     if (dup_fd < 0) return false;
     sc->glImportMemoryFdEXT(pi->gl_memobj, pi->size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, dup_fd);
     if (glGetError() != GL_NO_ERROR) return false;
+    /* GL has imported (and now owns) its dup of the fd. Close the original
+       so we drop OUR reference. The VkDeviceMemory handle still keeps the
+       underlying memory alive on the Vulkan side. Keeping the original fd
+       open is harmless on the desktop driver but on Tegra L4T r32.x it
+       creates two parallel kernel-object references for the same underlying
+       NvRm resource — and the driver's cleanup logic doesn't always handle
+       that correctly under heavy submit traffic, leading to NvRmSyncClose
+       crashing on a double-close. */
+    close(pi->mem_fd);
+    pi->mem_fd = -1;
 
     glGenTextures(1, &pi->gl_texture);
     glBindTexture(GL_TEXTURE_2D, pi->gl_texture);
@@ -1000,6 +1010,16 @@ static bool gl_import_semaphores(Swapchain *sc, PerImage *pi) {
     if (glGetError() != GL_NO_ERROR) return false;
     sc->glImportSemaphoreFdEXT(pi->gl_sample_sem, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd2);
     if (glGetError() != GL_NO_ERROR) return false;
+    /* Same reasoning as gl_import_image: close the originals now that GL owns
+       its duplicates. The VkSemaphore handles keep the Vulkan-side semaphores
+       alive; the fds are just transport handles for cross-API import and we
+       no longer need them. On Tegra L4T r32.x, keeping them open alongside
+       GL's duplicates is what causes NvRmSyncClose to crash under load
+       (observed with PPSSPP and other high-submit-rate apps). */
+    close(pi->vk_render_done_fd);
+    close(pi->gl_sample_done_fd);
+    pi->vk_render_done_fd = -1;
+    pi->gl_sample_done_fd = -1;
     return true;
 }
 
@@ -1019,10 +1039,10 @@ static void destroy_perimage(DevNode *dev, Swapchain *sc, PerImage *pi) {
     if (pi->image)          d->DestroyImage    (dev->device, pi->image, NULL);
     if (pi->memory)         d->FreeMemory      (dev->device, pi->memory, NULL);
 
-    /* Close the fds we still own. Note: the fds we duped into GL are owned
-       by GL now; the ones we duped into Vulkan-internal (none in our flow)
-       would be owned by Vulkan. The "originals" from vkGetMemoryFdKHR /
-       vkGetSemaphoreFdKHR are still ours. */
+    /* The fds we hold here are normally -1 by this point: we close them
+       immediately after duping into GL (see gl_import_image and
+       gl_import_semaphores for the rationale). The guards below only fire
+       if setup partially failed before the imports happened. */
     if (pi->mem_fd            >= 0) close(pi->mem_fd);
     if (pi->vk_render_done_fd >= 0) close(pi->vk_render_done_fd);
     if (pi->gl_sample_done_fd >= 0) close(pi->gl_sample_done_fd);
