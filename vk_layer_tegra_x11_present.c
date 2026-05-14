@@ -442,6 +442,12 @@ typedef struct Swapchain {
     VkFormat      format;
     VkColorSpaceKHR color_space;
     VkPresentModeKHR present_mode;
+    /* Usage flags the app requested for swapchain images. We honor these
+       (OR'd with what we need ourselves) when creating our images. PPSSPP
+       in particular asks for INPUT_ATTACHMENT_BIT for its subpass effects;
+       if we don't provide it, the app's later render passes / pipelines
+       are valid at creation time but the GPU faults on use. */
+    VkImageUsageFlags image_usage;
 
     PerImage      images[MAX_IMAGES];
 
@@ -873,10 +879,16 @@ static VkResult create_exportable_image(DevNode *dev, Swapchain *sc, PerImage *p
     ici.mipLevels = 1; ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-              | VK_IMAGE_USAGE_SAMPLED_BIT
-              | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-              | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    /* Honor whatever usage flags the app asked for on the swapchain, plus
+       what we need to do our job: SAMPLED_BIT so GL can sample the image,
+       COLOR_ATTACHMENT_BIT because the app will be rendering into it. The
+       OR is intentional — if the app already asked for SAMPLED or other
+       flags, we keep them. If they asked for INPUT_ATTACHMENT or STORAGE
+       or whatever, we honor that too. Strip PRESENT_SRC-only flags that
+       don't apply to our offscreen-allocated images. */
+    ici.usage = sc->image_usage
+              | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+              | VK_IMAGE_USAGE_SAMPLED_BIT;
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -1179,11 +1191,16 @@ layer_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physicalDevice,
     pCaps->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     pCaps->currentTransform    = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     pCaps->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    /* Advertise everything common we can actually back. Apps will only use
+       the bits they actually need, and we OR-include them in our image
+       create. */
     pCaps->supportedUsageFlags =
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
       | VK_IMAGE_USAGE_SAMPLED_BIT
       | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-      | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+      | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT
+      | VK_IMAGE_USAGE_STORAGE_BIT;
     return VK_SUCCESS;
 }
 
@@ -1334,6 +1351,7 @@ layer_CreateSwapchainKHR(VkDevice device,
     sc->format  = ci->imageFormat;
     sc->color_space = ci->imageColorSpace;
     sc->present_mode = ci->presentMode;
+    sc->image_usage  = ci->imageUsage;
     pthread_mutex_init(&sc->lock, NULL);
     for (uint32_t i = 0; i < MAX_IMAGES; i++) {
         sc->images[i].mem_fd = sc->images[i].vk_render_done_fd = sc->images[i].gl_sample_done_fd = -1;
