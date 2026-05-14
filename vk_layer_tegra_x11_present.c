@@ -672,11 +672,6 @@ static void *worker_thread_main(void *arg) {
             break;
         }
         uint32_t idx = sc->worker_pending_idx;
-        /* Clear pending and signal waiters before we start work, so the next
-           Present can post immediately. The backpressure happens at the NEXT
-           Present (which will block until we finish this one). */
-        sc->worker_pending = false;
-        pthread_cond_broadcast(&sc->worker_cv_done);
         pthread_mutex_unlock(&sc->worker_lock);
 
         /* Refresh window size if changed. Cheap when unchanged. Use the
@@ -711,6 +706,15 @@ static void *worker_thread_main(void *arg) {
                                  1, &sc->images[idx].gl_texture, dstLayouts);
         glFlush();
         glXSwapBuffers(sc->worker_dpy, sc->child_window);
+
+        /* Mark slot free AFTER the present completes. This is the
+           backpressure point: while worker_pending is true, any caller in
+           worker_post blocks. The worker is in vsync wait for most of those
+           16.6ms, so a fast app will be paced here. */
+        pthread_mutex_lock(&sc->worker_lock);
+        sc->worker_pending = false;
+        pthread_cond_broadcast(&sc->worker_cv_done);
+        pthread_mutex_unlock(&sc->worker_lock);
 
         frame_count++;
         if ((frame_count % 60) == 0) {
