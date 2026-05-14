@@ -120,6 +120,13 @@
 static int g_log_level = 1;   /* 0=silent, 1=warn/err, 2=info, 3=debug */
 static FILE *g_log_fp = NULL;
 
+/* Diagnostic mode: if VK_TEGRA_X11_PRESENT_DIAG=1 is set, every QueueSubmit
+   is followed by DeviceWaitIdle. This catches GPU faults at the offending
+   submit instead of letting them propagate to a later submit returning
+   DEVICE_LOST. It's catastrophically slow (every submit becomes synchronous)
+   and is only meant for one-shot fault localization. */
+static bool g_diag_wait_after_submit = false;
+
 static void layer_log_init(void) {
     /* X11 threading: must be called before any other Xlib function, otherwise
        multi-threaded use of Xlib will assert. We use multiple threads (the
@@ -130,6 +137,11 @@ static void layer_log_init(void) {
 
     const char *lvl = getenv("VK_TEGRA_X11_PRESENT_LOG");
     if (lvl) g_log_level = atoi(lvl);
+    const char *diag = getenv("VK_TEGRA_X11_PRESENT_DIAG");
+    if (diag && atoi(diag) == 1) {
+        g_diag_wait_after_submit = true;
+        fprintf(stderr, "[" LAYER_NAME "] DIAG MODE: DeviceWaitIdle after every submit (SLOW)\n");
+    }
     const char *path = getenv("VK_TEGRA_X11_PRESENT_LOG_FILE");
     if (path) {
         g_log_fp = fopen(path, "a");
@@ -1833,16 +1845,40 @@ VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
 layer_QueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo *pSubmits, VkFence fence) {
     DevNode *dev = dev_lookup(dispatch_key(queue));
     if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
+
+    static uint64_t submit_seq = 0;
+    uint64_t my_seq = 0;
+    if (g_diag_wait_after_submit) {
+        my_seq = __atomic_add_fetch(&submit_seq, 1, __ATOMIC_SEQ_CST);
+        LOG_INFO("DIAG QueueSubmit#%" PRIu64 ": queue=%p cnt=%u fence=%p [waits=%u cbs=%u sigs=%u]",
+                 my_seq, (void*)queue, submitCount, (void*)fence,
+                 pSubmits[0].waitSemaphoreCount,
+                 pSubmits[0].commandBufferCount,
+                 pSubmits[0].signalSemaphoreCount);
+    }
+
     VkResult r = dev->d.QueueSubmit(queue, submitCount, pSubmits, fence);
     if (r != VK_SUCCESS) {
-        LOG_ERR("vkQueueSubmit FAILED: ret=%d queue=%p submitCount=%u fence=%p",
-                r, (void*)queue, submitCount, (void*)fence);
+        LOG_ERR("vkQueueSubmit FAILED at seq#%" PRIu64 ": ret=%d queue=%p submitCount=%u fence=%p",
+                my_seq, r, (void*)queue, submitCount, (void*)fence);
         for (uint32_t i = 0; i < submitCount; i++) {
             LOG_ERR("  pSubmits[%u]: waitSem=%u cmdBuf=%u sigSem=%u",
                     i, pSubmits[i].waitSemaphoreCount,
                     pSubmits[i].commandBufferCount, pSubmits[i].signalSemaphoreCount);
         }
+        return r;
     }
+
+    if (g_diag_wait_after_submit) {
+        VkResult wr = dev->d.DeviceWaitIdle(dev->device);
+        if (wr != VK_SUCCESS) {
+            LOG_ERR("DIAG DeviceWaitIdle AFTER QueueSubmit#%" PRIu64 " returned %d "
+                    "(submit faulted: queue=%p cnt=%u cb_in_submit=%u)",
+                    my_seq, wr, (void*)queue, submitCount,
+                    submitCount > 0 ? pSubmits[0].commandBufferCount : 0);
+        }
+    }
+
     return r;
 }
 
