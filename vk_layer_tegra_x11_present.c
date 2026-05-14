@@ -2335,14 +2335,32 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pInterface) {
        as a sched_yield() loop rather than a kernel sleep. The thread running
        glXSwapBuffers therefore shows up at ~100% CPU in tools like top even
        though the actual work is trivial — it's all spent in sched_yield
-       between vblank checks. Setting __GL_YIELD=USLEEP tells Nvidia's driver
-       to insert usleep(1) calls between checks, which is enough to drop the
-       thread's measured CPU usage to single digits while preserving vsync
-       accuracy. We set it here, at the earliest point in our layer's
-       lifetime, before the application has had a chance to initialize GLX.
-       The "0" final arg means "don't overwrite if already set" — an
-       application or user override wins. */
-    setenv("__GL_YIELD", "USLEEP", 0);
+       between vblank checks.
+
+       KWin (the KDE X11 compositor) solved this exact problem years ago with
+       two Nvidia-specific env vars:
+
+         __GL_YIELD="nothing"    — Nvidia falls back to pthread_yield instead
+                                   of sched_yield. Combined with the queue-depth
+                                   limit below, this means the thread blocks on
+                                   real driver work instead of spinning.
+
+         __GL_MaxFramesAllowed=1 — Cap the driver's internal frame queue at 1.
+                                   Without this, the driver queues multiple
+                                   frames ahead, so glXSwapBuffers returns
+                                   quickly (the swap is queued) and the vsync
+                                   wait happens elsewhere as a spin. With queue
+                                   depth 1, glXSwapBuffers actually blocks until
+                                   the previous frame has presented — which on
+                                   Nvidia's path is a kernel wait, not a spin.
+
+       The pair works together. Setting only one gives modest improvement;
+       both together is what gets the worker thread to sleep properly.
+
+       The "0" final arg means "don't overwrite if already set" — application
+       or user env wins. */
+    setenv("__GL_YIELD",            "nothing", 0);
+    setenv("__GL_MaxFramesAllowed", "1",       0);
 
     /* Loud one-time banner so a tester running an older cached binary can spot
        the version mismatch immediately. Bump when the layer's behaviour changes. */
