@@ -1766,8 +1766,13 @@ layer_CmdPipelineBarrier(VkCommandBuffer cb,
     memcpy(fixed, imgBarriers, imgBarrierCount * sizeof(*fixed));
     for (uint32_t i = 0; i < imgBarrierCount; i++) {
         if (image_is_managed(fixed[i].image)) {
-            fixed[i].oldLayout = fix_layout(fixed[i].oldLayout);
-            fixed[i].newLayout = fix_layout(fixed[i].newLayout);
+            VkImageLayout o = fixed[i].oldLayout, n = fixed[i].newLayout;
+            fixed[i].oldLayout = fix_layout(o);
+            fixed[i].newLayout = fix_layout(n);
+            if (o != fixed[i].oldLayout || n != fixed[i].newLayout) {
+                LOG_INFO("CmdPipelineBarrier rewrite: img=%p old %d->%d new %d->%d",
+                         (void*)fixed[i].image, o, fixed[i].oldLayout, n, fixed[i].newLayout);
+            }
         }
     }
     dev->d.CmdPipelineBarrier(cb, srcStage, dstStage, depFlags,
@@ -1831,8 +1836,13 @@ layer_CreateRenderPass(VkDevice device,
     memcpy(fixed, pCreateInfo->pAttachments,
            pCreateInfo->attachmentCount * sizeof(*fixed));
     for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
+        VkImageLayout oi = fixed[i].initialLayout, of = fixed[i].finalLayout;
         fixed[i].initialLayout = fix_layout(fixed[i].initialLayout);
         fixed[i].finalLayout   = fix_layout(fixed[i].finalLayout);
+        if (oi != fixed[i].initialLayout || of != fixed[i].finalLayout) {
+            LOG_INFO("CreateRenderPass rewrite: attachment %u init %d->%d final %d->%d",
+                     i, oi, fixed[i].initialLayout, of, fixed[i].finalLayout);
+        }
     }
     VkRenderPassCreateInfo mod = *pCreateInfo;
     mod.pAttachments = fixed;
@@ -2320,6 +2330,20 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pInterface) {
     pInterface->pfnGetDeviceProcAddr        = vkGetDeviceProcAddr;
     pInterface->pfnGetPhysicalDeviceProcAddr = NULL;
     layer_log_init();
+
+    /* Nvidia's GLX on Tegra L4T r32.x implements glXSwapBuffers's vsync wait
+       as a sched_yield() loop rather than a kernel sleep. The thread running
+       glXSwapBuffers therefore shows up at ~100% CPU in tools like top even
+       though the actual work is trivial — it's all spent in sched_yield
+       between vblank checks. Setting __GL_YIELD=USLEEP tells Nvidia's driver
+       to insert usleep(1) calls between checks, which is enough to drop the
+       thread's measured CPU usage to single digits while preserving vsync
+       accuracy. We set it here, at the earliest point in our layer's
+       lifetime, before the application has had a chance to initialize GLX.
+       The "0" final arg means "don't overwrite if already set" — an
+       application or user override wins. */
+    setenv("__GL_YIELD", "USLEEP", 0);
+
     /* Loud one-time banner so a tester running an older cached binary can spot
        the version mismatch immediately. Bump when the layer's behaviour changes. */
     fprintf(stderr, "[" LAYER_NAME "] loaded, build %s %s (negotiated interface v2)\n",
