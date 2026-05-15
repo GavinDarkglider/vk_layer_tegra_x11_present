@@ -127,29 +127,6 @@ static FILE *g_log_fp = NULL;
    and is only meant for one-shot fault localization. */
 static bool g_diag_wait_after_submit = false;
 
-/* Runs at .so load time, before the application has had a chance to load
-   libGL or read any Nvidia-driver env vars. This is the only point at which
-   we can reliably affect __GL_YIELD: setting it from vkNegotiateLoader is
-   too late, because libGL has already been loaded by then and Nvidia's
-   driver caches the env value at library init.
-
-   Implicit Vulkan layers are loaded by the Vulkan loader at vkCreateInstance.
-   For RetroArch, that's after libretro core init but before any GL setup, so
-   our constructor fires in time. For purely GLX apps (vkcube doesn't apply
-   but the layer is harmless for them; non-Vulkan apps wouldn't load us),
-   this code never runs because the loader never loads us.
-
-   The "0" final arg to setenv means "don't overwrite if already set" — an
-   application or user override wins.
-
-   See the explanation in vkNegotiateLoaderLayerInterfaceVersion for why
-   USLEEP specifically (and not "nothing" as KWin recommends on modern
-   drivers) is what works on Tegra L4T r32.x. */
-__attribute__((constructor))
-static void layer_early_init(void) {
-    setenv("__GL_YIELD", "USLEEP", 0);
-}
-
 static void layer_log_init(void) {
     /* X11 threading: must be called before any other Xlib function, otherwise
        multi-threaded use of Xlib will assert. We use multiple threads (the
@@ -2373,28 +2350,6 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pInterface) {
     pInterface->pfnGetDeviceProcAddr        = vkGetDeviceProcAddr;
     pInterface->pfnGetPhysicalDeviceProcAddr = NULL;
     layer_log_init();
-
-    /* Nvidia's GLX on Tegra L4T r32.x implements glXSwapBuffers's vsync wait
-       as a sched_yield() loop rather than a kernel sleep. The thread running
-       glXSwapBuffers therefore shows up at ~100% CPU in tools like top even
-       though the actual work is trivial — it's all spent in sched_yield
-       between vblank checks.
-
-       KWin (the KDE X11 compositor) handles this on modern Nvidia drivers
-       with __GL_YIELD="nothing" + __GL_MaxFramesAllowed=1 — the idea being
-       to let glXSwapBuffers genuinely block instead of spinning. That combo
-       does NOT work on r32.x: empirically the thread still pegs CPU. The
-       r32.x driver doesn't actually do a kernel sleep on swap; it always
-       spins. Without a yield, it spins even harder.
-
-       What does work on r32.x is __GL_YIELD="USLEEP". That tells Nvidia to
-       insert usleep(1) between iterations of the yield loop, which is enough
-       to keep the kernel from scheduling the thread at full priority and
-       drops measured CPU to single digits while preserving vsync accuracy.
-
-       The "0" final arg means "don't overwrite if already set" — application
-       or user env wins. */
-    setenv("__GL_YIELD", "USLEEP", 0);
 
     /* Loud one-time banner so a tester running an older cached binary can spot
        the version mismatch immediately. Bump when the layer's behaviour changes. */

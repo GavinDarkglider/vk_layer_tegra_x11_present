@@ -116,21 +116,37 @@ vsync wait as a `sched_yield()` loop instead of a kernel sleep. The thread
 running `glXSwapBuffers` therefore shows up at ~100% CPU in tools like
 `top` even when the actual work is trivial.
 
-To work around this, the layer sets `__GL_YIELD=USLEEP` in its `.so`
-constructor, before the application has had a chance to load `libGL`. This
-tells NVIDIA's driver to insert `usleep(1)` between vblank checks, which
-drops measured CPU usage on the worker thread to single digits while
-preserving vsync accuracy.
+The fix is to set `__GL_YIELD=USLEEP`, which tells NVIDIA's driver to use
+`usleep(1)` between vblank checks. CPU drops to single digits, vsync
+accuracy is preserved.
 
-If your launch environment overrides `__GL_YIELD` to something else,
-that wins (the constructor uses `setenv(..., 0)` which doesn't overwrite).
-On modern desktop NVIDIA drivers, `__GL_YIELD="nothing"` is the better
-choice; on Tegra L4T r32.x specifically it is not — the driver still
-spins. `USLEEP` is the right value for this driver vintage.
+The catch: `libnvidia-glcore` reads `__GL_YIELD` at libGL initialization
+and caches the value. By the time the Vulkan loader has loaded this
+layer, libGL has already been loaded and the cache is set. Setting the
+variable from a `.so` constructor or from `vkNegotiateLoaderLayer` is
+too late. The KWin team hit the same wall and worked around it
+differently (see
+[their commit](https://github.com/KDE/kwin/commit/3ce5af5c21fd80e3da231b50c39c3ae357e9f15c)),
+but on Tegra L4T r32.x specifically their `__GL_MaxFramesAllowed=1`
+workaround does not help — only `__GL_YIELD=USLEEP` does, and it must be
+set from the shell environment before the application launches.
 
-If for some reason the constructor runs too late (the layer is loaded
-after `libGL` has already initialized), set `__GL_YIELD=USLEEP` in your
-launch script before invoking the application:
+To handle this transparently, the install step drops a shell fragment
+at `/etc/profile.d/99-tegra-x11-present.sh` that exports
+`__GL_YIELD=USLEEP`. Any login shell, systemd service inheriting from a
+profile-shell parent, or interactive session picks it up automatically.
+The fragment is short and self-documenting; users who want to disable
+the override can simply delete or edit the file.
+
+For non-shell launch paths (e.g. a systemd unit that starts before
+profile.d runs), add the export explicitly:
+
+```ini
+[Service]
+Environment=__GL_YIELD=USLEEP
+```
+
+Or in a launch script:
 
 ```sh
 __GL_YIELD=USLEEP retroarch
@@ -170,9 +186,18 @@ Ubuntu noble (default targets):
 sudo make install
 ```
 
-This installs the .so to `/usr/lib/aarch64-linux-gnu/` and the JSON to
-`/usr/share/vulkan/implicit_layer.d/`. The Vulkan loader picks the layer
-up automatically — no environment variable required.
+This installs three files:
+
+- the `.so` to `/usr/lib/aarch64-linux-gnu/` (or wherever `LAYERLIBDIR` points)
+- the implicit-layer JSON to `/usr/share/vulkan/implicit_layer.d/`
+- a shell fragment to `/etc/profile.d/99-tegra-x11-present.sh` that exports
+  `__GL_YIELD=USLEEP` for any login shell
+
+The Vulkan loader picks the layer up automatically once the .so and JSON
+are in place — no per-app environment variable required for the layer
+itself. The profile.d fragment is what keeps the worker thread off the
+CPU during vsync waits; see "NVIDIA driver environment" above for the
+underlying reasoning.
 
 The Lakka build recipe applies a patch that sets `LAYERLIBDIR=/usr/lib`
 to match Lakka's flat library layout. No source changes are required.
@@ -216,7 +241,7 @@ should be locked to the display refresh rate.
 | `VK_TEGRA_X11_PRESENT_LOG=N` | Log verbosity: 0=silent, 1=warn/err (default), 2=info, 3=debug. |
 | `VK_TEGRA_X11_PRESENT_LOG_FILE=PATH` | Append logs to `PATH` in addition to stderr. |
 | `VK_TEGRA_X11_PRESENT_DIAG=1` | Diagnostic mode. After every `vkQueueSubmit`, the layer calls `vkDeviceWaitIdle` and reports if the GPU faulted on that submit. Catastrophically slow (every submit becomes synchronous), useful only for one-shot fault localization. |
-| `__GL_YIELD=USLEEP` | NVIDIA driver env var. Auto-set by the layer's `.so` constructor; document here for awareness. See "NVIDIA driver environment" above. |
+| `__GL_YIELD=USLEEP` | NVIDIA driver env var. Installed automatically via `/etc/profile.d/99-tegra-x11-present.sh`. Must be set in the shell environment before the application loads libGL. See "NVIDIA driver environment" above. |
 
 ## Limitations and known issues
 
