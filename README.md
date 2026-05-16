@@ -1,302 +1,249 @@
 # vk_layer_tegra_x11_present
 
-An implicit Vulkan layer for NVIDIA Tegra L4T r32.x (Tegra X1, Switch, Jetson
-Nano family) that fixes tearing in Vulkan-on-X11 applications by routing
-presentation through GL/GLX.
+A Vulkan implicit layer that fixes broken Vulkan→X11 presentation on
+NVIDIA Tegra L4T r32.x by routing presentation through GL/GLX instead of
+the native Vulkan WSI path.
+
+Built originally for Nintendo Switch running Lakka and L4T r32.x; should
+work unchanged on any Tegra device on the r32.x BSP whose Vulkan driver
+has the same WSI tearing problem.
 
 ## What it does
 
-On Tegra L4T r32.x, the NVIDIA Vulkan ICD's X11 WSI implementation does not
-produce vsync-locked presentation. Frames tear. This is a driver bug that
-NVIDIA will not fix; the r32.x BSP is EOL'd and the device is no longer
-supported.
+The NVIDIA Vulkan ICD shipped with L4T r32.x has a broken X11 WSI
+implementation: presented frames tear regardless of present mode. The BSP
+is end-of-life and there is no driver fix. The same driver, however,
+provides:
 
-The same driver, however, does fully support:
-
-- Vulkan external memory export with OPAQUE_FD handle type (OPTIMAL tiling,
-  BGRA8/RGBA8 UNORM and SRGB)
-- Vulkan external semaphore export with OPAQUE_FD handle type
+- Vulkan external memory and semaphore export via
+  `VK_KHR_external_memory_fd` and `VK_KHR_external_semaphore_fd`
+  (OPAQUE_FD handle type)
 - GL import of both via `GL_EXT_memory_object_fd` and `GL_EXT_semaphore_fd`
-- Vsync-locked GLX presentation via `glXSwapIntervalEXT(1)` + `glXSwapBuffers`
+- Working vsync-locked GL presentation via `GLX_SGI_video_sync`
 
-This layer plumbs the two stacks together. The application uses Vulkan
-normally; the layer replaces the X11 swapchain with one whose images are
-OPAQUE_FD-exported Vulkan images. At present time, the layer imports each
-image into a GLX context as a GL texture, has GL draw it to the GLX window's
-back buffer, and calls `glXSwapBuffers`. The application is unaware that GL
-is involved.
+This layer plumbs the three together. The application's Vulkan rendering
+is untouched. We replace the WSI surface and swapchain with our own
+implementation that:
 
-The result is vsync-locked, tear-free presentation on a driver that
-otherwise can't do it.
+1. Allocates swapchain images as OPAQUE_FD-exportable Vulkan images.
+2. Imports each image into a GL/GLX context as a GL texture.
+3. At `vkQueuePresentKHR` time: bridges the application's render-done
+   semaphore into a GL semaphore and hands the image to a per-swapchain
+   worker thread.
+4. The worker samples the image into the GLX backbuffer, calls
+   `glXSwapBuffers`, then explicitly blocks on the hardware vblank via
+   `glXWaitVideoSyncSGI`. This is the same vsync mechanism KWin uses for
+   NVIDIA on X11.
+5. Bridges GL's sample-done back into a Vulkan semaphore so that the
+   next `vkAcquireNextImageKHR` correctly gates the application's re-use
+   of the image.
 
-## What it does not do
+No EGL, no dmabuf, no DRM, no custom kernel modules. Only the Vulkan↔GL
+interop primitives that the stock driver provides.
 
-- **EGL.** Not used. The driver advertises `EGL_EXT_image_dma_buf_import`
-  but the Vulkan ICD refuses to export dmabufs, so no dmabuf path works
-  through EGL. The layer goes around EGL entirely.
-- **DRM/KMS.** Not used. `tegra-udrm` is a stub on this BSP and is not loaded
-  by default on Ubuntu noble builds. The layer never opens `/dev/dri/card*`.
-- **libgbm.** Not used. The cross-allocate-then-import workaround was
-  considered and dropped once direct Vulkan↔GL interop was confirmed working.
-- **Wayland.** Not in scope. This layer hooks the X11 surface extensions
-  (`VK_KHR_xlib_surface`, `VK_KHR_xcb_surface`) only. Wayland surfaces are
-  passed through to the underlying WSI unmodified.
-- **MAILBOX present mode.** Not yet implemented. The layer reports support
-  for `VK_PRESENT_MODE_FIFO_KHR`, `VK_PRESENT_MODE_FIFO_RELAXED_KHR`, and
-  `VK_PRESENT_MODE_IMMEDIATE_KHR`. Apps requesting MAILBOX get FIFO.
+## Status
 
-## How it works
+Working on Lakka L4T r32.x Switch builds.
 
-For each swapchain image (N images per swapchain, configurable 2–8):
+Tested:
 
-1. **Vulkan allocation.** The layer creates a `VkImage` with
-   `VK_IMAGE_TILING_OPTIMAL` and `VkExternalMemoryImageCreateInfo` requesting
-   `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`. The backing
-   `VkDeviceMemory` is allocated with `VkExportMemoryAllocateInfo` for the
-   same handle type. An fd is exported via `vkGetMemoryFdKHR`.
+- vkcube — clean 60Hz vsync
+- RetroArch with various Vulkan-capable cores (Dolphin etc.) — clean,
+  no tearing, expected idle CPU
+- Sascha Willems Vulkan samples (triangle, bloom, and the rest of the
+  suite) — work normally; the symbol-export tightening in v2 fixed an
+  earlier loader-deadlock with these
+- PPSSPP libretro core — works for simple titles; some titles fault, see
+  KNOWN ISSUES
 
-2. **GL import.** The layer creates a GLX 3.3-core context on the X window
-   bound to the surface, makes it current, and:
-   - Calls `glCreateMemoryObjectsEXT` and `glImportMemoryFdEXT` with a `dup()`
-     of the Vulkan fd. GL takes ownership of its copy.
-   - Creates a `GL_TEXTURE_2D` and binds it to the imported memory with
-     `glTexStorageMem2DEXT` (`GL_RGBA8` or `GL_SRGB8_ALPHA8` as appropriate).
+## Architecture
 
-3. **Semaphore pairs.** Each image gets two `VkSemaphore` objects, both
-   created with `VkExportSemaphoreCreateInfo` for `OPAQUE_FD`:
-   - `vk_render_done[i]` — Vulkan signals after the application's render
-     completes, GL waits before sampling. Bridged in `vkQueuePresentKHR`.
-   - `gl_sample_done[i]` — GL signals after sampling completes, Vulkan
-     waits before the application re-acquires the image. Bridged in
-     `vkAcquireNextImageKHR`.
-   - The fds are exported via `vkGetSemaphoreFdKHR` and imported into GL
-     via `glGenSemaphoresEXT` + `glImportSemaphoreFdEXT`.
-
-4. **Acquire** (`vkAcquireNextImageKHR`):
-   - Picks the next free image index (round-robin).
-   - Issues a bridge Vulkan submit: wait on `gl_sample_done[i]`, signal the
-     application's requested acquire semaphore, signal our internal per-image
-     fence.
-   - CPU-blocks on the internal fence with `vkWaitForFences`. This is the
-     backpressure point — the call returns only when GL has actually
-     finished sampling the image, which paces the application to the real
-     presentation rate.
-   - Returns the index.
-
-5. **Present** (`vkQueuePresentKHR`):
-   - Issues a Vulkan bridge submit: wait on the application's present-time
-     wait semaphores, signal `vk_render_done[i]`.
-   - Posts the image index to the swapchain's worker thread via a single-slot
-     queue. If the worker is still processing the previous frame, the post
-     blocks; otherwise it returns immediately.
-   - Returns to the application.
-
-6. **Worker thread** (one per swapchain, lifetime-pinned to swapchain):
-   - Owns the GLX context for the swapchain's entire lifetime. The context
-     is made current at thread start and never released until the worker
-     exits. This eliminates per-frame `glXMakeCurrent` overhead and isolates
-     `glXSwapBuffers`'s vsync wait from the application's render thread.
-   - Opens its own X `Display*` connection. Xlib is not thread-safe to
-     share even with `XInitThreads`; the main thread and the worker need
-     separate connections.
-   - Loop: wait for a posted image index, refresh window geometry if the
-     parent window resized, `glWaitSemaphoreEXT(vk_render_done[i])`,
-     blit textured quad, `glSignalSemaphoreEXT(gl_sample_done[i])`,
-     `glXSwapBuffers`. Then mark the slot free.
-
-The cost per present is two Vulkan submits and a single textured-quad
-draw. The application's render thread is paced by `vkAcquireNextImageKHR`'s
-fence wait; the worker thread is paced by `glXSwapBuffers`'s vsync wait.
-Measured pacing on Tegra X1: clean 60 Hz lock.
-
-## NVIDIA driver environment
-
-On Tegra L4T r32.x, NVIDIA's GLX implementation does `glXSwapBuffers`'s
-vsync wait as a `sched_yield()` loop instead of a kernel sleep. The thread
-running `glXSwapBuffers` therefore shows up at ~100% CPU in tools like
-`top` even when the actual work is trivial.
-
-The fix is to set `__GL_YIELD=USLEEP`, which tells NVIDIA's driver to use
-`usleep(1)` between vblank checks. CPU drops to single digits, vsync
-accuracy is preserved.
-
-The catch: `libnvidia-glcore` reads `__GL_YIELD` at libGL initialization
-and caches the value. By the time the Vulkan loader has loaded this
-layer, libGL has already been loaded and the cache is set. Setting the
-variable from a `.so` constructor or from `vkNegotiateLoaderLayer` is
-too late. The KWin team hit the same wall and worked around it
-differently (see
-[their commit](https://github.com/KDE/kwin/commit/3ce5af5c21fd80e3da231b50c39c3ae357e9f15c)),
-but on Tegra L4T r32.x specifically their `__GL_MaxFramesAllowed=1`
-workaround does not help — only `__GL_YIELD=USLEEP` does, and it must be
-set from the shell environment before the application launches.
-
-To handle this transparently, the install step drops a shell fragment
-at `/etc/profile.d/99-tegra-x11-present.sh` that exports
-`__GL_YIELD=USLEEP`. Any login shell, systemd service inheriting from a
-profile-shell parent, or interactive session picks it up automatically.
-The fragment is short and self-documenting; users who want to disable
-the override can simply delete or edit the file.
-
-For non-shell launch paths (e.g. a systemd unit that starts before
-profile.d runs), add the export explicitly:
-
-```ini
-[Service]
-Environment=__GL_YIELD=USLEEP
+```
+Application's render thread                       Worker thread (per swapchain)
+─────────────────────────                         ──────────────────────────
+vkAcquireNextImageKHR
+  ├── bridge submit: wait gl_sample[i], signal acquire_sem,
+  │   signal acquire_fence
+  └── WaitForFences(acquire_fence)   ← backpressure                    ←┐
+                                                                        │
+[app renders into image i]                                              │
+                                                                        │
+vkQueuePresentKHR                                                       │
+  ├── bridge submit: wait app_render_done, signal vk_render_done[i]     │
+  └── post {idx=i} to worker mailbox                  → take work       │
+                                                       glWaitSemaphoreEXT(vk_render_done)
+                                                       draw textured quad
+                                                       glSignalSemaphoreEXT(gl_sample[i])  ─┘
+                                                       glXSwapBuffers (interval 0)
+                                                       glXWaitVideoSyncSGI  ← kernel vsync wait
+                                                       mark mailbox free
 ```
 
-Or in a launch script:
+The worker thread owns the GLX context for the swapchain's entire
+lifetime and opens its own Xlib `Display*` (Xlib is not thread-safe to
+share even with `XInitThreads`).
 
-```sh
-__GL_YIELD=USLEEP retroarch
-```
+The backpressure point is the `WaitForFences` in
+`vkAcquireNextImageKHR`: the fence signals only after the worker has
+actually consumed the image through GL. The app's render loop is paced
+to real presentation rate through this fence.
+
+## Why glXWaitVideoSyncSGI and not just glXSwapBuffers
+
+NVIDIA's `glXSwapBuffers` on Tegra L4T r32.x implements its built-in
+vsync wait as a `sched_yield()` busy loop, not a kernel sleep. A thread
+parked in that wait shows up as ~100% CPU in `top` even though it's
+doing nothing useful. On a Switch, that one core is hot, drawing power,
+and triggering DVFS upclocks.
+
+Setting swap interval to 0 stops `glXSwapBuffers` from doing that wait
+at all. Instead, the worker explicitly waits for the next vblank using
+`glXWaitVideoSyncSGI`, which goes through the kernel and actually
+sleeps. The CPU stays cold during vsync.
+
+This is the same workaround KWin uses for NVIDIA on X11
+([reference](https://github.com/KDE/kwin/blob/master/src/plugins/platforms/x11/standalone/glxbackend.cpp)
+— search for `SGIVideoSyncVsyncMonitor`).
+
+If `GLX_SGI_video_sync` is not available at runtime (it should always
+be on NVIDIA proprietary drivers), the layer falls back to swap
+interval 1 + `glXSwapBuffers` for vsync. A line in the log on swapchain
+creation tells you which path is active.
+
+## Runtime library loading
+
+The `.so` does NOT link libGL, libGLX, or libX11. It depends only on
+libc, libdl, and libpthread.
+
+This is deliberate. The Vulkan loader dlopens implicit layers while
+holding an internal mutex during `vkCreateInstance`. If our DT_NEEDED
+list included libGL, ld.so would run libGL's constructor as part of the
+load, with the loader's mutex held, and on some loader/driver
+combinations that constructor calls back into the Vulkan loader (e.g.,
+glvnd vendor registration) — which then tries to acquire the
+already-held mutex, and the whole vkCreateInstance hangs.
+
+The fix: `dlopen()` libGL / libGLX / libX11 ourselves at swapchain
+creation time, well past the loader-mutex window, and resolve every
+function via `dlsym` into a small table. The call sites use `#define`
+macros to redirect transparently — `glXSwapBuffers(...)` expands to
+`g_libs.glXSwapBuffers(...)`.
+
+## Symbol export
+
+Only `vkNegotiateLoaderLayerInterfaceVersion` is exported from the
+`.so`. `vkGetInstanceProcAddr` and `vkGetDeviceProcAddr` are NOT
+exported.
+
+Why: under Vulkan layer interface v2, the loader stores the layer's
+GIPA and GDPA function pointers from the `VkNegotiateLayerInterface`
+struct filled in by negotiate, and calls them directly. The loader does
+not need those symbols exported by name.
+
+But if we DO export them, the loader's ICD-load path can do
+`dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr")` and find OUR symbol
+instead of the loader's own. The loader then re-enters our GIPA looking
+for `vkCreateInstance`, gets our `layer_CreateInstance`, calls it —
+while the outer `vkCreateInstance` is still on the stack with the
+loader mutex held. Recursive deadlock.
+
+The fix is one line in the version script: only export
+`vkNegotiateLoaderLayerInterfaceVersion`. Confirmed with
+`nm -D --defined-only libVkLayer_tegra_x11_present.so`.
+
+## Vulkan queue serialization
+
+The application's `vkQueueSubmit` calls and the layer's internal bridge
+submits are serialized through a per-device mutex. This is required by
+the Vulkan spec (external synchronization on the queue parameter) and
+matters when the application uses a separate render thread (PPSSPP,
+Citra, etc.). The cost is negligible — a mutex acquire per submit. Apps
+that submit from a single thread pay nothing.
 
 ## Compositor coexistence
 
-The layer sets `_NET_WM_BYPASS_COMPOSITOR=1` on the surface window before
-swapchain creation. On EWMH-compliant compositors (Mutter, KWin, Compiz)
-this causes the compositor to stop redirecting the window, so
-`glXSwapBuffers` reaches the display directly. On Lakka and other
-compositor-less environments the hint is harmless. Even with the hint
-ignored, presentation pacing remained vsync-locked in testing — the layer
-does not require the absence of a compositor to function.
+If a compositor is running and is the only thing rendering to the
+screen, we still produce vsync-locked output to our window; the
+compositor then syncs that to its own present cadence. Some compositors
+(KWin, Mutter) may detect that we're drawing as fast as we can and
+throttle accordingly.
 
-## Building
+For Lakka (no compositor running), we're directly painting to the X
+window on the root and vsync timing is end-to-end accurate.
 
-```sh
-make
-```
+## Layout transition handling
 
-For cross-compilation:
+The Vulkan WSI defines `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` for swapchain
+images. Real WSI implementations track that as a hardware-meaningful
+state. We don't have a real swapchain — our images are normal Vulkan
+images with no presentation layout — so any pipeline barrier or render
+pass that transitions our images to/from `PRESENT_SRC_KHR` would fault
+the GPU on this driver.
 
-```sh
-make CROSS_COMPILE=aarch64-linux-gnu- SYSROOT=/path/to/sysroot
-```
-
-Override install paths if your distro doesn't use multiarch:
-
-```sh
-make install LAYERLIBDIR=/usr/lib LAYERJSONDIR=/etc/vulkan/implicit_layer.d
-```
-
-Ubuntu noble (default targets):
-
-```sh
-sudo make install
-```
-
-This installs three files:
-
-- the `.so` to `/usr/lib/aarch64-linux-gnu/` (or wherever `LAYERLIBDIR` points)
-- the implicit-layer JSON to `/usr/share/vulkan/implicit_layer.d/`
-- a shell fragment to `/etc/profile.d/99-tegra-x11-present.sh` that exports
-  `__GL_YIELD=USLEEP` for any login shell
-
-The Vulkan loader picks the layer up automatically once the .so and JSON
-are in place — no per-app environment variable required for the layer
-itself. The profile.d fragment is what keeps the worker thread off the
-CPU during vsync waits; see "NVIDIA driver environment" above for the
-underlying reasoning.
-
-The Lakka build recipe applies a patch that sets `LAYERLIBDIR=/usr/lib`
-to match Lakka's flat library layout. No source changes are required.
-
-### Build dependencies
-
-- A C compiler (gcc or clang)
-- Vulkan loader and headers (`libvulkan-dev`)
-- OpenGL and GLX headers (`libgl1-mesa-dev` — installs glvnd loaders and
-  headers; the actual runtime calls go through NVIDIA's driver)
-- Xlib + XCB headers (`libx11-dev`, `libxcb1-dev`, `libx11-xcb-dev`)
-- pthread
-
-On Ubuntu noble:
-
-```sh
-sudo apt install build-essential libvulkan-dev libgl1-mesa-dev \
-                 libx11-dev libxcb1-dev libx11-xcb-dev
-```
-
-## Verifying
-
-After installation, run any Vulkan-on-X11 application. The layer should be
-loaded automatically. Confirm with:
-
-```sh
-VK_TEGRA_X11_PRESENT_LOG=2 your_vulkan_app 2>&1 | grep VK_LAYER_TEGRA
-```
-
-You should see `CreateInstance`, `CreateXlibSurfaceKHR` (or
-`CreateXcbSurfaceKHR`), and `CreateSwapchainKHR` log lines.
-
-Visually: the application should render without tearing. Frame pacing
-should be locked to the display refresh rate.
+The layer intercepts `vkCmdPipelineBarrier`, `vkCreateRenderPass`, and
+`vkCreateRenderPass2KHR` and rewrites any `PRESENT_SRC_KHR` layout on a
+managed image to `SHADER_READ_ONLY_OPTIMAL`. Application code is
+unchanged; the rewrite is invisible.
 
 ## Environment variables
 
 | Variable | Effect |
 |---|---|
-| `VK_TEGRA_X11_PRESENT_DISABLE=1` | Passthrough mode. The layer loads but forwards every call unmodified to the next layer / ICD. Useful for A/B comparison against the broken native WSI. |
+| `VK_TEGRA_X11_PRESENT_DISABLE=1` | Passthrough mode — the layer loads but forwards every call unmodified. Useful for A/B testing against the native (broken) WSI. Honored by the Vulkan loader via `disable_environment` in the manifest. |
 | `VK_TEGRA_X11_PRESENT_LOG=N` | Log verbosity: 0=silent, 1=warn/err (default), 2=info, 3=debug. |
 | `VK_TEGRA_X11_PRESENT_LOG_FILE=PATH` | Append logs to `PATH` in addition to stderr. |
-| `VK_TEGRA_X11_PRESENT_DIAG=1` | Diagnostic mode. After every `vkQueueSubmit`, the layer calls `vkDeviceWaitIdle` and reports if the GPU faulted on that submit. Catastrophically slow (every submit becomes synchronous), useful only for one-shot fault localization. |
-| `__GL_YIELD=USLEEP` | NVIDIA driver env var. Installed automatically via `/etc/profile.d/99-tegra-x11-present.sh`. Must be set in the shell environment before the application loads libGL. See "NVIDIA driver environment" above. |
+| `VK_TEGRA_X11_PRESENT_DIAG=1` | Diagnostic mode. After every `vkQueueSubmit`, the layer calls `vkDeviceWaitIdle` and reports if the GPU faulted on that submit. Catastrophically slow; one-shot use only for fault localization. |
 
-## Limitations and known issues
+## Build and install
 
-- **Vulkan queue serialization.** The application's `vkQueueSubmit` and
-  the layer's internal bridge submits are serialized through a per-device
-  mutex. This is required by the Vulkan spec (external synchronization on
-  the queue) and matters when the application uses a separate render
-  thread (PPSSPP, Citra, etc.). The cost is negligible: a mutex acquire
-  per submit. Apps that only submit from one thread pay nothing.
+```sh
+make
+sudo make install
+```
 
-- **Image format restrictions.** The application's swapchain format must
-  be one of `VK_FORMAT_B8G8R8A8_UNORM`, `VK_FORMAT_R8G8B8A8_UNORM`,
-  `VK_FORMAT_B8G8R8A8_SRGB`, or `VK_FORMAT_R8G8B8A8_SRGB`. Other formats
-  fall through to the broken native WSI (with a warning).
+This installs the `.so` to `/usr/lib/aarch64-linux-gnu/` and the layer
+JSON to `/usr/share/vulkan/implicit_layer.d/`. The Vulkan loader picks
+the layer up automatically — no per-app environment variable required.
 
-- **No surface support for non-X11 platforms.** The layer hooks
-  `VkSurfaceKHR` only for Xlib and XCB surfaces. Wayland, Win32, Android,
-  and other surface types are passed through unchanged.
+For non-multiarch layouts (Lakka, similar embedded distros), override
+the library install path:
 
-- **Soft-fail on setup failure.** If the layer cannot create its GLX
-  context or allocate OPAQUE_FD-exportable images, `vkCreateSwapchainKHR`
-  falls through to the underlying WSI rather than failing the app. The
-  application runs with the original tearing behavior. A `WARN` log
-  message identifies what failed.
+```sh
+make install LAYERLIBDIR=/usr/lib
+```
 
-## Why a layer and not a wrapper / patch / Mesa fix
+The Lakka build recipe does this automatically.
 
-- **A wrapper around the application** would have to be RetroArch-specific
-  and rebuilt every time RetroArch's WSI usage changed. The layer applies
-  to every Vulkan-on-X11 app on the system unchanged.
+### Build dependencies
 
-- **A patch to the application** has the same problem and requires the
-  application to be open source and rebuildable.
+- A C compiler (gcc or clang)
+- Vulkan headers (`vulkan/vulkan.h`, `vulkan/vk_layer.h`, `vulkan/vk_icd.h`)
+- GL/GLX/X11 headers (for the type declarations only — these libraries
+  are not linked at build time)
 
-- **A Mesa fix** doesn't apply — the broken WSI is NVIDIA's, not Mesa's.
-  Mesa isn't involved in the Vulkan path on this driver.
+### Runtime dependencies
 
-- **An NVIDIA fix** isn't coming. The r32.x BSP is EOL.
+- libc, libdl, libpthread (DT_NEEDED)
+- libGL / libGLX / libX11 (dlopen'd at swapchain creation; must be
+  present at runtime)
+- Vulkan loader 1.1+ with layer interface v2 support
+- An NVIDIA Tegra Vulkan ICD (or any ICD that supports the OPAQUE_FD
+  external memory/semaphore extensions and `GLX_SGI_video_sync`)
 
-An implicit Vulkan layer is the right shape: it transparently intercepts
-the broken behavior at the lowest possible level, requires no application
-changes, and ships as one .so + one JSON.
+## Known issues
 
-## License
+- **PPSSPP libretro core (some titles).** Some titles trigger a GPU
+  fault in PPSSPP's render path that returns `VK_ERROR_DEVICE_LOST` from
+  a later `vkQueueSubmit`. Without validation layers on Lakka we can't
+  pinpoint the offending command. Simple titles work fine; complex
+  titles with heavy post-processing don't. Use
+  `VK_TEGRA_X11_PRESENT_DIAG=1` to narrow down which submit faults.
 
-Same as the parent project. (Replace this line with the actual SPDX
-identifier on commit.)
+## Files
 
-## History
-
-Version 1 of this layer attempted to use `EGL_EXT_image_dma_buf_import` for
-the present path. That approach does not work on Tegra L4T r32.x because
-the NVIDIA Vulkan ICD does not export dmabufs — every combination of format
-and tiling returns `VK_ERROR_FORMAT_NOT_SUPPORTED` at capability query
-time. The layer was rewritten to use `GL_EXT_memory_object_fd` instead,
-which the driver does support. The Xorg extension shim that was developed
-to work around EGL dmabuf failures is no longer needed and is not part of
-this branch.
+```
+vk_layer_tegra_x11_present.c     main source
+vk_layer_tegra_x11_present.json  Vulkan loader manifest
+vk_layer_tegra_x11_present.map   linker version script (export control)
+Makefile                         build and install
+```

@@ -1,23 +1,19 @@
 # Makefile for vk_layer_tegra_x11_present
 #
 # Builds an implicit Vulkan layer that fixes Tegra L4T r32.x's broken X11
-# WSI presentation by routing it through GL/GLX. See README.md for the
-# why and how.
+# WSI presentation by routing it through GL/GLX. See README.md.
 #
 # Variables (override on the make command line or in your build recipe):
 #
 #   CROSS_COMPILE     toolchain prefix, e.g. aarch64-linux-gnu-
 #   SYSROOT           target sysroot for headers and libraries
 #   PREFIX            install prefix (default /usr)
-#   SYSCONFDIR        system config dir for profile.d (default /etc)
 #   LAYERLIBDIR       where the shared object goes; defaults to a
 #                     multiarch path under $(PREFIX)/lib but Lakka and
 #                     other distros that don't use multiarch should
 #                     override this to plain $(PREFIX)/lib
 #   LAYERJSONDIR      where the implicit-layer JSON goes; default is
 #                     /usr/share/vulkan/implicit_layer.d
-#   PROFILEDDIR       where the shell profile fragment goes; default
-#                     /etc/profile.d
 #   DESTDIR           staging root for installation
 #
 # The library_path in the JSON is intentionally a bare filename, not an
@@ -27,16 +23,12 @@
 CROSS_COMPILE ?=
 SYSROOT       ?=
 PREFIX        ?= /usr
-SYSCONFDIR    ?= /etc
 
 # Default to Ubuntu/Debian multiarch. Lakka's package recipe overrides
 # this to $(PREFIX)/lib.
 ARCH          ?= aarch64-linux-gnu
 LAYERLIBDIR   ?= $(PREFIX)/lib/$(ARCH)
 LAYERJSONDIR  ?= $(PREFIX)/share/vulkan/implicit_layer.d
-# Profile.d is the only reliable way to set __GL_YIELD before libGL caches
-# the value. Setting it from a .so constructor runs too late on Tegra L4T.
-PROFILEDDIR   ?= $(SYSCONFDIR)/profile.d
 
 # CC selection:
 # - If CC was set on the command line or in the environment, use that (this is
@@ -60,7 +52,6 @@ TARGET   := libVkLayer_tegra_x11_present.so
 SRC      := vk_layer_tegra_x11_present.c
 JSON     := vk_layer_tegra_x11_present.json
 MAPFILE  := vk_layer_tegra_x11_present.map
-PROFILESH := 99-tegra-x11-present.sh
 
 CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
 CFLAGS  += $(SYSROOT_FLAGS)
@@ -68,8 +59,13 @@ CFLAGS  += $(SYSROOT_FLAGS)
 # Always required for a shared library, regardless of what the environment
 # provides in CFLAGS:
 # - -fPIC: position-independent code (mandatory for .so)
-# - -fvisibility=hidden: hide internal symbols (only the three loader-resolved
-#   entrypoints are exported via the version script)
+# - -fvisibility=hidden: hide internal symbols. The version script then
+#   only exports vkNegotiateLoaderLayerInterfaceVersion. Importantly, we
+#   do NOT export vkGetInstanceProcAddr or vkGetDeviceProcAddr — exporting
+#   them causes the Vulkan loader's ICD-load path to dlsym our symbols and
+#   recursively re-enter our layer while the loader-side mutex is held,
+#   deadlocking vkCreateInstance. The loader gets those entrypoints from
+#   the negotiate-supplied function pointers instead.
 LAYER_CFLAGS := -fPIC -fvisibility=hidden
 
 # LDFLAGS handling:
@@ -79,7 +75,17 @@ LAYER_CFLAGS := -fPIC -fvisibility=hidden
 #   -shared the linker builds an executable, looks for _start/main, and fails).
 #   So they go into a separate LAYER_LDFLAGS that's always added.
 LAYER_LDFLAGS := -shared -Wl,--no-undefined -Wl,--version-script=$(MAPFILE) $(SYSROOT_FLAGS)
-LDLIBS  := -lvulkan -lGL -lX11 -lX11-xcb -lxcb -lpthread -ldl -lm
+
+# LDLIBS: we deliberately do NOT link libGL, libGLX, or libX11 at build
+# time. See the big comment near the top of vk_layer_tegra_x11_present.c
+# for the loader-deadlock rationale; the short version is that if libGL
+# is in our DT_NEEDED, the Vulkan loader's dlopen() of our .so triggers
+# libGL's constructor which can call back into the loader during a
+# critical section, causing recursive-mutex deadlock during
+# vkCreateInstance. Instead we dlopen() the GL/X11 libraries at
+# CreateSwapchain time and resolve every function via dlsym.
+# -ldl gives us dlopen/dlsym.
+LDLIBS  := -lpthread -ldl
 
 .PHONY: all clean install uninstall
 
@@ -93,13 +99,10 @@ install: all
 	$(INSTALL) -m 0755 $(TARGET) $(DESTDIR)$(LAYERLIBDIR)/$(TARGET)
 	$(INSTALL) -d $(DESTDIR)$(LAYERJSONDIR)
 	$(INSTALL) -m 0644 $(JSON) $(DESTDIR)$(LAYERJSONDIR)/$(JSON)
-	$(INSTALL) -d $(DESTDIR)$(PROFILEDDIR)
-	$(INSTALL) -m 0644 $(PROFILESH) $(DESTDIR)$(PROFILEDDIR)/$(PROFILESH)
 
 uninstall:
 	rm -f $(DESTDIR)$(LAYERLIBDIR)/$(TARGET)
 	rm -f $(DESTDIR)$(LAYERJSONDIR)/$(JSON)
-	rm -f $(DESTDIR)$(PROFILEDDIR)/$(PROFILESH)
 
 clean:
 	rm -f $(TARGET)

@@ -17,8 +17,7 @@
  *   - Vulkan external semaphore export via VK_KHR_external_semaphore_fd
  *     (OPAQUE_FD handle type)
  *   - GL import of both via GL_EXT_memory_object_fd and GL_EXT_semaphore_fd
- *   - Working vsync-locked GL presentation through GLX (glXSwapIntervalEXT(1)
- *     + glXSwapBuffers).
+ *   - Working vsync-locked GL presentation through GLX_SGI_video_sync.
  *
  * This layer plumbs the two together. The application's Vulkan rendering is
  * untouched; we replace the WSI surface and swapchain with our own
@@ -29,31 +28,56 @@
  *      images).
  *   2. Imports each image into our GL/GLX context as a GL texture.
  *   3. At vkQueuePresentKHR time: bridges the application's render-done
- *      semaphore into a GL semaphore, has GL sample the texture into the
- *      GLX-owned default framebuffer, and calls glXSwapBuffers.
+ *      semaphore into a GL semaphore and posts the image to our worker.
  *   4. Bridges GL's sample-done back into a Vulkan semaphore so that the
  *      next vkAcquireNextImageKHR correctly gates the application's
  *      re-use of the image.
  *
- * No EGL, no dmabuf, no DRM. Only Nvidia's own Vulkan↔GL interop primitives,
- * which are supported on this driver.
+ * No EGL, no dmabuf, no DRM. Only Nvidia's own Vulkan↔GL interop primitives.
  *
- * THREADING
+ * ARCHITECTURE
  *
- * GLX contexts are not safe to use from multiple threads without explicit
- * make-current handoffs. We make the context current on whichever thread
- * calls vkQueuePresentKHR, do the GL work, and un-make-current. The cost
- * is a few hundred microseconds per present; negligible at 60Hz.
+ * One worker thread per swapchain owns the GLX context for the lifetime of
+ * the swapchain. The application's render thread calls Acquire/Present;
+ * Present hands work to the worker via a single-slot mailbox and returns
+ * immediately. The worker samples the image into the GLX backbuffer, calls
+ * glXSwapBuffers (with swap interval 0), then blocks on the actual hardware
+ * vblank via glXWaitVideoSyncSGI. This pattern lets the worker thread sleep
+ * in the kernel during vsync, rather than spinning in libGLX_nvidia's
+ * sched_yield-based default wait. The technique is the same one KWin uses
+ * for NVIDIA on X11 (see plugins/platforms/x11/standalone/glxbackend.cpp,
+ * SGIVideoSyncVsyncMonitor).
  *
- * Applications that call vkQueuePresentKHR from different threads on the
- * same swapchain are unusual; we log a warning if we detect it but still
- * function correctly because make-current serializes us.
+ * vkAcquireNextImageKHR CPU-blocks the application on a per-image fence
+ * that the worker signals via the GL→Vulkan semaphore bridge; this is what
+ * paces the app's render loop to real presentation rate.
+ *
+ * RUNTIME LIBRARY LOADING
+ *
+ * The .so does not link libGL, libGLX, or libX11. The Vulkan loader holds
+ * an internal mutex during vkCreateInstance and dlopen()s implicit layers;
+ * if our DT_NEEDED listed libGL, that library's constructor would run with
+ * the loader mutex held, and on some systems that constructor calls back
+ * into the loader, recursively deadlocking. We dlopen GL/X11 ourselves at
+ * CreateSwapchain time (well past the loader-mutex window) and resolve
+ * every function via dlsym into a table. See the lib_load() block.
+ *
+ * SYMBOL EXPORT
+ *
+ * Only vkNegotiateLoaderLayerInterfaceVersion is exported from the .so.
+ * vkGetInstanceProcAddr and vkGetDeviceProcAddr are NOT — exporting them
+ * causes the Vulkan loader's ICD-load path to resolve our symbols via
+ * dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr") and re-enter our layer
+ * recursively while the loader mutex is still held, deadlocking
+ * vkCreateInstance. The loader doesn't need these symbols exported under
+ * interface v2; it gets the function pointers from the
+ * VkNegotiateLayerInterface struct that our negotiate fills in.
  *
  * BYPASS
  *
  * Setting the environment variable VK_TEGRA_X11_PRESENT_DISABLE=1 turns
- * the layer into a transparent passthrough. Useful for debugging or for
- * comparing tearing behavior with/without the layer.
+ * the layer into a transparent passthrough. Useful for A/B testing the
+ * native WSI against the layer-redirected one.
  */
 
 #define _GNU_SOURCE
@@ -85,6 +109,246 @@
 #include <X11/Xlib-xcb.h>
 #include <X11/Xatom.h>
 #include <xcb/xcb.h>
+#include <dlfcn.h>
+
+/* RUNTIME LIBRARY LOADING
+ *
+ * We deliberately do NOT link against libGL, libGLX, or libX11 at build
+ * time. The reason: implicit Vulkan layers are dlopen()'d by the Vulkan
+ * loader while it holds an internal mutex during vkCreateInstance. If our
+ * .so has DT_NEEDED entries for libGL, ld.so will recursively load libGL
+ * before our constructors run, and libGL's own constructor (via the glvnd
+ * dispatch path) calls back into the Vulkan loader to register vendor
+ * support. That callback tries to acquire the same loader mutex that the
+ * outer vkCreateInstance already holds — recursive deadlock.
+ *
+ * Observed symptom: Sascha Willems Vulkan samples hang inside
+ * vkCreateInstance with a backtrace showing recursive entry into the
+ * loader's createInstance through libGL's init path. RetroArch and vkcube
+ * don't hit it because they happen to load libGL via other paths before
+ * vkCreateInstance fires.
+ *
+ * Workaround: dlopen libGL/libGLX/libX11 ourselves at CreateSwapchain time
+ * (when no loader mutex is held) and call every function through a table
+ * of dlsym'd function pointers. The .so itself depends only on libc,
+ * libdl, libpthread, and libvulkan headers (Vulkan calls go through the
+ * layer dispatch, never linked).
+ *
+ * The macros after the LibTable struct redirect all GL/GLX/X11 calls in
+ * the rest of this file to go through the table — minimal source-level
+ * impact, but the link-time dependency vanishes. */
+
+#define X11_FUNCS(M) \
+    M(XInitThreads,      Status,  (void)) \
+    M(XOpenDisplay,      Display*,(const char *)) \
+    M(XCloseDisplay,     int,     (Display *)) \
+    M(XInternAtom,       Atom,    (Display *, const char *, Bool)) \
+    M(XCreateColormap,   Colormap,(Display *, Window, Visual *, int)) \
+    M(XCreateWindow,     Window,  (Display *, Window, int, int, unsigned, unsigned, unsigned, int, unsigned, Visual *, unsigned long, XSetWindowAttributes *)) \
+    M(XDestroyWindow,    int,     (Display *, Window)) \
+    M(XFreeColormap,     int,     (Display *, Colormap)) \
+    M(XFree,             int,     (void *)) \
+    M(XMapWindow,        int,     (Display *, Window)) \
+    M(XGetGeometry,      Status,  (Display *, Drawable, Window *, int *, int *, unsigned *, unsigned *, unsigned *, unsigned *)) \
+    M(XResizeWindow,     int,     (Display *, Window, unsigned, unsigned)) \
+    M(XFlush,            int,     (Display *)) \
+    M(XChangeProperty,   int,     (Display *, Window, Atom, Atom, int, int, const unsigned char *, int))
+
+#define GL_FUNCS(M) \
+    M(glGetError,                GLenum,  (void)) \
+    M(glClear,                   void,    (GLbitfield)) \
+    M(glClearColor,              void,    (GLfloat, GLfloat, GLfloat, GLfloat)) \
+    M(glViewport,                void,    (GLint, GLint, GLsizei, GLsizei)) \
+    M(glActiveTexture,           void,    (GLenum)) \
+    M(glBindTexture,             void,    (GLenum, GLuint)) \
+    M(glGenTextures,             void,    (GLsizei, GLuint *)) \
+    M(glDeleteTextures,          void,    (GLsizei, const GLuint *)) \
+    M(glTexParameteri,           void,    (GLenum, GLenum, GLint)) \
+    M(glDrawArrays,              void,    (GLenum, GLint, GLsizei)) \
+    M(glBindVertexArray,         void,    (GLuint)) \
+    M(glGenVertexArrays,         void,    (GLsizei, GLuint *)) \
+    M(glDeleteVertexArrays,      void,    (GLsizei, const GLuint *)) \
+    M(glBindBuffer,              void,    (GLenum, GLuint)) \
+    M(glGenBuffers,              void,    (GLsizei, GLuint *)) \
+    M(glDeleteBuffers,           void,    (GLsizei, const GLuint *)) \
+    M(glBufferData,              void,    (GLenum, GLsizeiptr, const void *, GLenum)) \
+    M(glEnableVertexAttribArray, void,    (GLuint)) \
+    M(glVertexAttribPointer,     void,    (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)) \
+    M(glCreateShader,            GLuint,  (GLenum)) \
+    M(glDeleteShader,            void,    (GLuint)) \
+    M(glShaderSource,            void,    (GLuint, GLsizei, const GLchar *const *, const GLint *)) \
+    M(glCompileShader,           void,    (GLuint)) \
+    M(glGetShaderiv,             void,    (GLuint, GLenum, GLint *)) \
+    M(glGetShaderInfoLog,        void,    (GLuint, GLsizei, GLsizei *, GLchar *)) \
+    M(glCreateProgram,           GLuint,  (void)) \
+    M(glDeleteProgram,           void,    (GLuint)) \
+    M(glAttachShader,            void,    (GLuint, GLuint)) \
+    M(glLinkProgram,             void,    (GLuint)) \
+    M(glGetProgramiv,            void,    (GLuint, GLenum, GLint *)) \
+    M(glGetProgramInfoLog,       void,    (GLuint, GLsizei, GLsizei *, GLchar *)) \
+    M(glUseProgram,              void,    (GLuint)) \
+    M(glGetUniformLocation,      GLint,   (GLuint, const GLchar *)) \
+    M(glUniform1i,               void,    (GLint, GLint)) \
+    M(glFlush,                   void,    (void))
+
+#define GLX_FUNCS(M) \
+    M(glXChooseFBConfig,         GLXFBConfig*, (Display *, int, const int *, int *)) \
+    M(glXGetVisualFromFBConfig,  XVisualInfo*, (Display *, GLXFBConfig)) \
+    M(glXCreateNewContext,       GLXContext,   (Display *, GLXFBConfig, int, GLXContext, Bool)) \
+    M(glXDestroyContext,         void,         (Display *, GLXContext)) \
+    M(glXMakeCurrent,            Bool,         (Display *, GLXDrawable, GLXContext)) \
+    M(glXSwapBuffers,            void,         (Display *, GLXDrawable)) \
+    M(glXGetProcAddressARB,      __GLXextFuncPtr, (const GLubyte *))
+
+/* Generate function-pointer typedefs for each entry. */
+#define DECL_TYPEDEF(name, ret, args) typedef ret (*PFN_##name)args;
+X11_FUNCS(DECL_TYPEDEF)
+GL_FUNCS (DECL_TYPEDEF)
+GLX_FUNCS(DECL_TYPEDEF)
+#undef DECL_TYPEDEF
+
+/* The pointer table, populated by lib_load(). */
+typedef struct {
+    void *handle_x11;
+    void *handle_gl;
+    void *handle_glx;
+    bool  loaded;
+#define DECL_FIELD(name, ret, args) PFN_##name name;
+    X11_FUNCS(DECL_FIELD)
+    GL_FUNCS (DECL_FIELD)
+    GLX_FUNCS(DECL_FIELD)
+#undef DECL_FIELD
+} LibTable;
+
+static LibTable g_libs;
+static pthread_mutex_t g_libs_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* dlopen and resolve everything. Idempotent; safe to call from multiple
+   threads. Called from CreateSwapchain (which is past the loader-mutex
+   window that causes the deadlock if we'd been DT_NEEDED-linked). */
+static bool lib_load(void) {
+    pthread_mutex_lock(&g_libs_lock);
+    if (g_libs.loaded) {
+        pthread_mutex_unlock(&g_libs_lock);
+        return true;
+    }
+    /* Open libraries. libX11 first (libGL pulls it transitively, but we want
+       to control which version). RTLD_GLOBAL so GLX dispatch resolves any
+       symbols it needs across the libraries. */
+    g_libs.handle_x11 = dlopen("libX11.so.6", RTLD_LAZY | RTLD_GLOBAL);
+    if (!g_libs.handle_x11) g_libs.handle_x11 = dlopen("libX11.so",   RTLD_LAZY | RTLD_GLOBAL);
+    g_libs.handle_gl  = dlopen("libGL.so.1",  RTLD_LAZY | RTLD_GLOBAL);
+    if (!g_libs.handle_gl)  g_libs.handle_gl  = dlopen("libGL.so",    RTLD_LAZY | RTLD_GLOBAL);
+    g_libs.handle_glx = dlopen("libGLX.so.0", RTLD_LAZY | RTLD_GLOBAL);
+    if (!g_libs.handle_glx) g_libs.handle_glx = g_libs.handle_gl;  /* libGL provides glX* on most stacks */
+
+    if (!g_libs.handle_x11 || !g_libs.handle_gl) {
+        fprintf(stderr, "[" "VK_LAYER_TEGRA_x11_present" "] lib_load: failed to dlopen libX11/libGL (%s)\n",
+                dlerror());
+        pthread_mutex_unlock(&g_libs_lock);
+        return false;
+    }
+
+    /* Resolve each symbol. We try the GL handle first for GL/GLX, then GLX
+       handle as fallback, then global. For X11 symbols, X11 handle. */
+#define RESOLVE_X11(name, ret, args) \
+    g_libs.name = (PFN_##name)dlsym(g_libs.handle_x11, #name); \
+    if (!g_libs.name) g_libs.name = (PFN_##name)dlsym(RTLD_DEFAULT, #name);
+#define RESOLVE_GL(name, ret, args) \
+    g_libs.name = (PFN_##name)dlsym(g_libs.handle_gl, #name); \
+    if (!g_libs.name) g_libs.name = (PFN_##name)dlsym(RTLD_DEFAULT, #name);
+#define RESOLVE_GLX(name, ret, args) \
+    g_libs.name = (PFN_##name)dlsym(g_libs.handle_glx, #name); \
+    if (!g_libs.name) g_libs.name = (PFN_##name)dlsym(g_libs.handle_gl, #name); \
+    if (!g_libs.name) g_libs.name = (PFN_##name)dlsym(RTLD_DEFAULT, #name);
+    X11_FUNCS(RESOLVE_X11)
+    GL_FUNCS (RESOLVE_GL)
+    GLX_FUNCS(RESOLVE_GLX)
+#undef RESOLVE_X11
+#undef RESOLVE_GL
+#undef RESOLVE_GLX
+
+    /* Now that XInitThreads is resolved, call it before any other Xlib
+       function fires. Xlib requires this to enable its internal locking
+       when multiple threads use Xlib (our worker thread has its own
+       Display, but Xlib's internal locking is still a process-wide thing).
+       Has to be called before any other Xlib call in the process. */
+    if (g_libs.XInitThreads) g_libs.XInitThreads();
+
+    g_libs.loaded = true;
+    pthread_mutex_unlock(&g_libs_lock);
+    return true;
+}
+
+/* Source-level redirection: every callsite below that says glXXX(...) or
+   XXX(...) for X11 functions becomes g_libs.glXXX(...) without source
+   changes. */
+#define DECL_REMAP(name, ret, args) static const PFN_##name name##_indirect = NULL; (void)name##_indirect;
+/* The above is unused; what we really want is a per-name #define. */
+#undef DECL_REMAP
+
+#define REMAP(name, ret, args) static inline ret name args;
+/* Also unused — we just use the literal macros below. */
+#undef REMAP
+
+#define XInitThreads              (g_libs.XInitThreads)
+#define XOpenDisplay              (g_libs.XOpenDisplay)
+#define XCloseDisplay             (g_libs.XCloseDisplay)
+#define XInternAtom               (g_libs.XInternAtom)
+#define XCreateColormap           (g_libs.XCreateColormap)
+#define XCreateWindow             (g_libs.XCreateWindow)
+#define XDestroyWindow            (g_libs.XDestroyWindow)
+#define XFreeColormap             (g_libs.XFreeColormap)
+#define XFree                     (g_libs.XFree)
+#define XMapWindow                (g_libs.XMapWindow)
+#define XGetGeometry              (g_libs.XGetGeometry)
+#define XResizeWindow             (g_libs.XResizeWindow)
+#define XFlush                    (g_libs.XFlush)
+#define XChangeProperty           (g_libs.XChangeProperty)
+
+#define glGetError                (g_libs.glGetError)
+#define glClear                   (g_libs.glClear)
+#define glClearColor              (g_libs.glClearColor)
+#define glViewport                (g_libs.glViewport)
+#define glActiveTexture           (g_libs.glActiveTexture)
+#define glBindTexture             (g_libs.glBindTexture)
+#define glGenTextures             (g_libs.glGenTextures)
+#define glDeleteTextures          (g_libs.glDeleteTextures)
+#define glTexParameteri           (g_libs.glTexParameteri)
+#define glDrawArrays              (g_libs.glDrawArrays)
+#define glBindVertexArray         (g_libs.glBindVertexArray)
+#define glGenVertexArrays         (g_libs.glGenVertexArrays)
+#define glDeleteVertexArrays      (g_libs.glDeleteVertexArrays)
+#define glBindBuffer              (g_libs.glBindBuffer)
+#define glGenBuffers              (g_libs.glGenBuffers)
+#define glDeleteBuffers           (g_libs.glDeleteBuffers)
+#define glBufferData              (g_libs.glBufferData)
+#define glEnableVertexAttribArray (g_libs.glEnableVertexAttribArray)
+#define glVertexAttribPointer     (g_libs.glVertexAttribPointer)
+#define glCreateShader            (g_libs.glCreateShader)
+#define glDeleteShader            (g_libs.glDeleteShader)
+#define glShaderSource            (g_libs.glShaderSource)
+#define glCompileShader           (g_libs.glCompileShader)
+#define glGetShaderiv             (g_libs.glGetShaderiv)
+#define glGetShaderInfoLog        (g_libs.glGetShaderInfoLog)
+#define glCreateProgram           (g_libs.glCreateProgram)
+#define glDeleteProgram           (g_libs.glDeleteProgram)
+#define glAttachShader            (g_libs.glAttachShader)
+#define glLinkProgram             (g_libs.glLinkProgram)
+#define glGetProgramiv            (g_libs.glGetProgramiv)
+#define glGetProgramInfoLog       (g_libs.glGetProgramInfoLog)
+#define glUseProgram              (g_libs.glUseProgram)
+#define glGetUniformLocation      (g_libs.glGetUniformLocation)
+#define glUniform1i               (g_libs.glUniform1i)
+#define glFlush                   (g_libs.glFlush)
+
+#define glXChooseFBConfig         (g_libs.glXChooseFBConfig)
+#define glXGetVisualFromFBConfig  (g_libs.glXGetVisualFromFBConfig)
+#define glXCreateNewContext       (g_libs.glXCreateNewContext)
+#define glXDestroyContext         (g_libs.glXDestroyContext)
+#define glXMakeCurrent            (g_libs.glXMakeCurrent)
+#define glXSwapBuffers            (g_libs.glXSwapBuffers)
+#define glXGetProcAddressARB      (g_libs.glXGetProcAddressARB)
 
 /* The vendored vk_layer.h used to define VK_LAYER_EXPORT for us, but the
    modern Vulkan-Loader removed it in favor of the layer's own visibility
@@ -128,12 +392,10 @@ static FILE *g_log_fp = NULL;
 static bool g_diag_wait_after_submit = false;
 
 static void layer_log_init(void) {
-    /* X11 threading: must be called before any other Xlib function, otherwise
-       multi-threaded use of Xlib will assert. We use multiple threads (the
-       app's main thread + our worker), each with its own Display* — but Xlib
-       still requires XInitThreads to enable its internal locking. Calling
-       this here, from negotiate-loader, is the earliest reliable point. */
-    XInitThreads();
+    /* X11 threading initialization is deferred until lib_load() runs at
+       CreateSwapchain time. We don't link libX11 directly anymore (see the
+       big comment near the top of this file for the loader-deadlock
+       rationale), so we can't call XInitThreads here. */
 
     const char *lvl = getenv("VK_TEGRA_X11_PRESENT_LOG");
     if (lvl) g_log_level = atoi(lvl);
@@ -147,8 +409,7 @@ static void layer_log_init(void) {
         g_log_fp = fopen(path, "a");
         if (g_log_fp) setvbuf(g_log_fp, NULL, _IONBF, 0);
     }
-    /* Make stderr unbuffered so log lines survive abnormal exit (assert/abort
-       in the application before we'd otherwise flush). */
+    /* Make stderr unbuffered so log lines survive abnormal exit. */
     setvbuf(stderr, NULL, _IONBF, 0);
 }
 
@@ -566,6 +827,18 @@ typedef struct Swapchain {
     PFNGLSIGNALSEMAPHOREEXTPROC      glSignalSemaphoreEXT;
     PFNGLDELETESEMAPHORESEXTPROC     glDeleteSemaphoresEXT;
 
+    /* GLX_SGI_video_sync entrypoints. When available, the worker uses
+       glXWaitVideoSyncSGI to block on the actual hardware vblank instead
+       of relying on glXSwapBuffers to do so. NVIDIA's Tegra L4T r32.x
+       implements glXSwapBuffers's vsync wait as a sched_yield() spin loop
+       that pins the worker thread at ~100% CPU. glXWaitVideoSyncSGI does
+       a real kernel-side vblank wait (DRM_IOCTL_WAIT_VBLANK or similar),
+       so the thread actually sleeps. Pattern lifted from KWin's
+       SGIVideoSyncVsyncMonitor — see
+       plugins/platforms/x11/standalone/glxbackend.cpp in the KWin tree. */
+    int  (*glXGetVideoSyncSGI )(unsigned int *count);
+    int  (*glXWaitVideoSyncSGI)(int divisor, int remainder, unsigned int *count);
+
     /* Acquire ring */
     uint32_t      next_acquire;       /* round-robin starting point */
 
@@ -709,11 +982,20 @@ static void *worker_thread_main(void *arg) {
         return NULL;
     }
 
-    /* Apply swap interval here, in the thread that owns the context. */
+    /* Apply swap interval here, in the thread that owns the context.
+       Strategy:
+       - If glXWaitVideoSyncSGI is available, set interval to 0. We do
+         not want glXSwapBuffers's internal vsync wait (which on NVIDIA
+         Tegra is a sched_yield spin loop); we'll pace explicitly with
+         the SGI wait, which sleeps in the kernel.
+       - If SGI is not available, fall back to the built-in vsync via
+         glXSwapBuffers (interval 1, or app's choice).
+       - IMMEDIATE and FIFO_RELAXED present modes ask for no vsync. */
     if (sc->glXSwapIntervalEXT) {
         int interval = 1;
         if (sc->present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) interval = 0;
         else if (sc->present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) interval = -1;
+        else if (sc->glXWaitVideoSyncSGI)                      interval = 0;
         sc->glXSwapIntervalEXT(sc->worker_dpy, sc->child_window, interval);
     }
 
@@ -765,10 +1047,36 @@ static void *worker_thread_main(void *arg) {
         glFlush();
         glXSwapBuffers(sc->worker_dpy, sc->child_window);
 
+        /* Block on the actual hardware vblank instead of relying on
+           glXSwapBuffers's built-in wait. On NVIDIA Tegra L4T r32.x the
+           built-in wait spins on sched_yield, pinning this thread at
+           ~100% CPU. glXWaitVideoSyncSGI does a real kernel-side wait,
+           so we sleep until the vblank fires. The pattern matches KWin's
+           SGIVideoSyncVsyncMonitor.
+
+           Skip the wait for non-FIFO present modes (where the app asked
+           for no pacing) and when SGI isn't available (in which case
+           glXSwapBuffers above did whatever vsync it was going to). */
+        if (sc->glXWaitVideoSyncSGI
+            && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR
+            && sc->present_mode != VK_PRESENT_MODE_MAILBOX_KHR) {
+            unsigned int count = 0;
+            /* Wait for the next vblank: any count whose parity is opposite
+               the current. Equivalent to "the next time the vsync counter
+               increments". Per spec, divisor=2 remainder=(cur+1)&1 returns
+               on the next vblank regardless of where in the cycle we are. */
+            if (sc->glXGetVideoSyncSGI(&count) == 0) {
+                sc->glXWaitVideoSyncSGI(2, (count + 1) & 1, &count);
+            } else {
+                /* Counter query failed; just ask for "next even vblank"
+                   which still gives us a wait. */
+                sc->glXWaitVideoSyncSGI(2, 0, &count);
+            }
+        }
+
         /* Mark slot free AFTER the present completes. This is the
            backpressure point: while worker_pending is true, any caller in
-           worker_post blocks. The worker is in vsync wait for most of those
-           16.6ms, so a fast app will be paced here. */
+           worker_post blocks. */
         pthread_mutex_lock(&sc->worker_lock);
         sc->worker_pending = false;
         pthread_cond_broadcast(&sc->worker_cv_done);
@@ -822,6 +1130,20 @@ static bool resolve_gl_funcs(Swapchain *sc) {
     GLX(PFNGLWAITSEMAPHOREEXTPROC,        glWaitSemaphoreEXT);
     GLX(PFNGLSIGNALSEMAPHOREEXTPROC,      glSignalSemaphoreEXT);
     GLX(PFNGLDELETESEMAPHORESEXTPROC,     glDeleteSemaphoresEXT);
+
+    /* GLX_SGI_video_sync. Optional; we fall back to glXSwapBuffers's
+       built-in vsync if not available. The functions take/return plain C
+       int and unsigned int, so no GLX-headers typedefs needed; the casts
+       to a local function-pointer type spell out the signatures. */
+    sc->glXGetVideoSyncSGI  =
+        (int (*)(unsigned *))         glXGetProcAddressARB((const GLubyte*)"glXGetVideoSyncSGI");
+    sc->glXWaitVideoSyncSGI =
+        (int (*)(int, int, unsigned*))glXGetProcAddressARB((const GLubyte*)"glXWaitVideoSyncSGI");
+    if (sc->glXGetVideoSyncSGI && sc->glXWaitVideoSyncSGI) {
+        LOG_INFO("GLX_SGI_video_sync present; using glXWaitVideoSyncSGI for vsync pacing");
+    } else {
+        LOG_INFO("GLX_SGI_video_sync NOT present; falling back to glXSwapBuffers vsync");
+    }
 #undef GLX
     if (!sc->glCreateMemoryObjectsEXT || !sc->glImportMemoryFdEXT || !sc->glTexStorageMem2DEXT
      || !sc->glGenSemaphoresEXT || !sc->glImportSemaphoreFdEXT
@@ -1133,6 +1455,12 @@ layer_CreateXlibSurfaceKHR(VkInstance instance,
         InstNode *in = inst_lookup(dispatch_key(instance));
         return in->d.CreateXlibSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
     }
+    /* set_bypass_compositor below uses XInternAtom and XChangeProperty.
+       Ensure libX11 is dlopen'd before we call them. */
+    if (!lib_load()) {
+        InstNode *in = inst_lookup(dispatch_key(instance));
+        return in->d.CreateXlibSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
+    }
     Surface *s = calloc(1, sizeof(*s));
     if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
     s->magic = SURFACE_MAGIC;
@@ -1152,6 +1480,12 @@ layer_CreateXcbSurfaceKHR(VkInstance instance,
                            const VkAllocationCallbacks *pAllocator,
                            VkSurfaceKHR *pSurface) {
     if (g_layer_disabled) {
+        InstNode *in = inst_lookup(dispatch_key(instance));
+        return in->d.CreateXcbSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
+    }
+    /* Make sure libX11 is loaded (we use XOpenDisplay/XInternAtom/XChangeProperty
+       below). See lib_load() for why this is deferred from layer init. */
+    if (!lib_load()) {
         InstNode *in = inst_lookup(dispatch_key(instance));
         return in->d.CreateXcbSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
     }
@@ -1365,6 +1699,17 @@ layer_CreateSwapchainKHR(VkDevice device,
     Surface *surf = as_surface(ci->surface);
     if (g_layer_disabled || !surf)
         return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
+
+    /* Lazy-load libX11, libGL, libGLX. We can't link these in at build time
+       because doing so causes a recursive-mutex deadlock inside the Vulkan
+       loader during vkCreateInstance — see the big block comment near the
+       top of this file. CreateSwapchain is the first point we actually
+       need them, and we're well past CreateInstance here, so no loader
+       mutex is held. lib_load() is idempotent and thread-safe. */
+    if (!lib_load()) {
+        LOG_ERR("CreateSwapchainKHR: failed to load libGL/libX11; falling through");
+        return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
+    }
 
     /* Clamp image count to our range. */
     uint32_t want = ci->minImageCount;
@@ -2328,26 +2673,22 @@ layer_GetInstanceProcAddr(VkInstance inst, const char *name) {
     return node->d.GetInstanceProcAddr(inst, name);
 }
 
-/* The Vulkan loader looks up these names by exact match. */
-VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-vkGetInstanceProcAddr(VkInstance inst, const char *name) {
-    return layer_GetInstanceProcAddr(inst, name);
-}
-VK_LAYER_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-vkGetDeviceProcAddr(VkDevice dev, const char *name) {
-    return layer_GetDeviceProcAddr(dev, name);
-}
-
 /* ----------------------------------------------------------------------- */
-/* Loader negotiation (Vulkan 1.1+ layer interface v2)                     */
+/* Loader negotiation (Vulkan layer interface v2)                          */
 /* ----------------------------------------------------------------------- */
 
 VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
 vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pInterface) {
     if (pInterface->loaderLayerInterfaceVersion < 2) return VK_ERROR_INITIALIZATION_FAILED;
     pInterface->loaderLayerInterfaceVersion = 2;
-    pInterface->pfnGetInstanceProcAddr      = vkGetInstanceProcAddr;
-    pInterface->pfnGetDeviceProcAddr        = vkGetDeviceProcAddr;
+    /* Wire negotiate to our INTERNAL (hidden) GIPA/GDPA, not the public
+       wrappers. The public wrappers are no longer exported by symbol; this
+       eliminates any chance of the loader's ICD-load path dlsym-ing our
+       symbol and re-entering us. The loader doesn't need the public symbol
+       in interface v2 — it stores these function pointers and calls them
+       directly. */
+    pInterface->pfnGetInstanceProcAddr      = layer_GetInstanceProcAddr;
+    pInterface->pfnGetDeviceProcAddr        = layer_GetDeviceProcAddr;
     pInterface->pfnGetPhysicalDeviceProcAddr = NULL;
     layer_log_init();
 
