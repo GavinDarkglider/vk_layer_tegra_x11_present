@@ -74,8 +74,8 @@ vkQueuePresentKHR                                                       │
                                                        glWaitSemaphoreEXT(vk_render_done)
                                                        draw textured quad
                                                        glSignalSemaphoreEXT(gl_sample[i])  ─┘
-                                                       glXSwapBuffers (interval 0)
-                                                       glXWaitVideoSyncSGI  ← kernel vsync wait
+                                                       glXSwapBuffers (interval 1 — driver vsync)
+                                                       glXWaitVideoSyncSGI  ← sleep until next vblank
                                                        mark mailbox free
 ```
 
@@ -88,27 +88,66 @@ The backpressure point is the `WaitForFences` in
 actually consumed the image through GL. The app's render loop is paced
 to real presentation rate through this fence.
 
-## Why glXWaitVideoSyncSGI and not just glXSwapBuffers
+## Vsync and CPU usage
 
-NVIDIA's `glXSwapBuffers` on Tegra L4T r32.x implements its built-in
-vsync wait as a `sched_yield()` busy loop, not a kernel sleep. A thread
-parked in that wait shows up as ~100% CPU in `top` even though it's
-doing nothing useful. On a Switch, that one core is hot, drawing power,
-and triggering DVFS upclocks.
+Two separate concerns here, handled separately:
 
-Setting swap interval to 0 stops `glXSwapBuffers` from doing that wait
-at all. Instead, the worker explicitly waits for the next vblank using
-`glXWaitVideoSyncSGI`, which goes through the kernel and actually
-sleeps. The CPU stays cold during vsync.
+**Tearing prevention.** The worker sets GLX swap interval 1 in the FIFO
+present modes, so `glXSwapBuffers` itself queues each swap to occur at
+the next hardware vblank on whatever display the GLX drawable is
+currently driving. This is what guarantees tear-free presentation. It
+works on the internal Switch panel and on external monitors via the
+dock's DisplayPort path regardless of the display's refresh rate.
 
-This is the same workaround KWin uses for NVIDIA on X11
+**CPU usage.** Setting swap interval 1 alone would also work for vsync
+on NVIDIA Tegra, except that NVIDIA's `glXSwapBuffers` implementation
+of the vsync wait is a `sched_yield()` busy loop, not a kernel sleep.
+The worker thread would show ~100% CPU even when doing nothing —
+draining battery and triggering DVFS upclocks.
+
+To get the thread to actually sleep, after each swap the worker calls
+`glXWaitVideoSyncSGI`, which performs a real kernel-side wait on the
+vblank counter. The thread sleeps in the kernel for most of the
+inter-frame interval. By the time the worker comes back around and
+calls `glXSwapBuffers` again, the previous swap has already completed
+and the next one is queued; the residual spin window inside
+`glXSwapBuffers` is brief.
+
+This pattern is the same one KWin uses for NVIDIA on X11
 ([reference](https://github.com/KDE/kwin/blob/master/src/plugins/platforms/x11/standalone/glxbackend.cpp)
 — search for `SGIVideoSyncVsyncMonitor`).
 
 If `GLX_SGI_video_sync` is not available at runtime (it should always
-be on NVIDIA proprietary drivers), the layer falls back to swap
-interval 1 + `glXSwapBuffers` for vsync. A line in the log on swapchain
-creation tells you which path is active.
+be on NVIDIA proprietary drivers), the layer keeps the swap-interval-1
+behavior — vsync still works, but the worker may show high CPU during
+the `glXSwapBuffers` wait. A line in the log on swapchain creation
+tells you which path is active.
+
+## Swap pipeline ordering
+
+Before each `glXSwapBuffers` the worker calls `glFinish()`, and after
+the swap it calls `XFlush()` on the worker's Display. Both matter:
+
+`glFinish` blocks until all queued GL commands actually complete on the
+GPU. With `glFlush` alone (which only kicks the command queue), the
+swap-at-vblank request in `glXSwapBuffers` can be queued while the
+sample draw is still in flight; the driver's vblank logic then races
+with the rendering. On the internal Switch panel this is harmless; on
+the docked HDMI output it manifests as a slowly-drifting tear line
+despite swap interval 1 being honored.
+
+`XFlush` pushes the swap request out of Xlib's output buffer onto the
+wire to the X server immediately, rather than letting it sit until the
+next X call (which in steady-state is `XGetGeometry` ~16ms later).
+Without it, the X server doesn't see the swap request until after the
+vblank it should have been scheduled for has already passed, also
+causing tearing.
+
+The cost of `glFinish` is one CPU stall per frame — sub-millisecond on
+a single textured quad. The cost of `XFlush` is one syscall. Both
+together close the worker's swap pipeline ordering tightly enough that
+the docked output sees the same clean vsync behavior as the internal
+panel.
 
 ## Runtime library loading
 

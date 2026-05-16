@@ -189,7 +189,8 @@
     M(glUseProgram,              void,    (GLuint)) \
     M(glGetUniformLocation,      GLint,   (GLuint, const GLchar *)) \
     M(glUniform1i,               void,    (GLint, GLint)) \
-    M(glFlush,                   void,    (void))
+    M(glFlush,                   void,    (void)) \
+    M(glFinish,                  void,    (void))
 
 #define GLX_FUNCS(M) \
     M(glXChooseFBConfig,         GLXFBConfig*, (Display *, int, const int *, int *)) \
@@ -341,6 +342,7 @@ static bool lib_load(void) {
 #define glGetUniformLocation      (g_libs.glGetUniformLocation)
 #define glUniform1i               (g_libs.glUniform1i)
 #define glFlush                   (g_libs.glFlush)
+#define glFinish                  (g_libs.glFinish)
 
 #define glXChooseFBConfig         (g_libs.glXChooseFBConfig)
 #define glXGetVisualFromFBConfig  (g_libs.glXGetVisualFromFBConfig)
@@ -982,20 +984,33 @@ static void *worker_thread_main(void *arg) {
         return NULL;
     }
 
-    /* Apply swap interval here, in the thread that owns the context.
-       Strategy:
-       - If glXWaitVideoSyncSGI is available, set interval to 0. We do
-         not want glXSwapBuffers's internal vsync wait (which on NVIDIA
-         Tegra is a sched_yield spin loop); we'll pace explicitly with
-         the SGI wait, which sleeps in the kernel.
-       - If SGI is not available, fall back to the built-in vsync via
-         glXSwapBuffers (interval 1, or app's choice).
-       - IMMEDIATE and FIFO_RELAXED present modes ask for no vsync. */
+    /* Swap interval strategy.
+       We always set interval 1 for FIFO present modes (the common case).
+       glXSwapBuffers then queues the swap to happen at the next vblank,
+       which is what actually prevents tearing on the active display —
+       essential when the output is going through DisplayPort to an
+       external monitor at an arbitrary refresh rate, where our worker's
+       loop pacing alone can't guarantee that pixels land between
+       scanouts. The driver-side swap-at-vblank is the only thing that
+       does that.
+
+       Even with interval 1, we still call glXWaitVideoSyncSGI later in
+       the loop. That's not for tearing — the swap already handled that
+       — but to put the worker thread to sleep until the next vblank so
+       it doesn't burn CPU in glXSwapBuffers's sched_yield wait loop.
+       By the time we re-enter glXSwapBuffers next iteration, the
+       previous swap has already completed and the next swap is queued
+       immediately, so the sched_yield burst inside glXSwapBuffers is
+       brief.
+
+       Present modes that explicitly want no vsync (IMMEDIATE) get
+       interval 0; FIFO_RELAXED gets late-tearing -1 if the driver
+       supports it. */
     if (sc->glXSwapIntervalEXT) {
         int interval = 1;
         if (sc->present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) interval = 0;
+        else if (sc->present_mode == VK_PRESENT_MODE_MAILBOX_KHR) interval = 0;
         else if (sc->present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) interval = -1;
-        else if (sc->glXWaitVideoSyncSGI)                      interval = 0;
         sc->glXSwapIntervalEXT(sc->worker_dpy, sc->child_window, interval);
     }
 
@@ -1044,32 +1059,41 @@ static void *worker_thread_main(void *arg) {
         GLenum dstLayouts[1] = { GL_LAYOUT_SHADER_READ_ONLY_EXT };
         sc->glSignalSemaphoreEXT(sc->images[idx].gl_sample_sem, 0, NULL,
                                  1, &sc->images[idx].gl_texture, dstLayouts);
-        glFlush();
+        /* glFinish forces all queued GL commands (including the sample draw
+           above) to actually complete on the GPU before we proceed. With
+           glFlush alone, glXSwapBuffers may queue the swap before the sample
+           draw has finished, and the driver's swap-at-vblank logic can race
+           with our rendering. On the docked HDMI output specifically, this
+           manifests as a slowly-drifting tear line even with swap interval 1.
+           glFinish closes that race at the cost of one CPU stall per frame —
+           the stall is short because the sample draw is a single textured
+           quad. */
+        glFinish();
         glXSwapBuffers(sc->worker_dpy, sc->child_window);
+        /* Force the X server to actually process the swap request now,
+           rather than batching it with whatever happens later. Without this,
+           the swap can sit in the Xlib output buffer until the next request
+           flushes it, which on some Tegra X configurations races with the
+           vblank we then wait for via glXWaitVideoSyncSGI. */
+        XFlush(sc->worker_dpy);
 
-        /* Block on the actual hardware vblank instead of relying on
-           glXSwapBuffers's built-in wait. On NVIDIA Tegra L4T r32.x the
-           built-in wait spins on sched_yield, pinning this thread at
-           ~100% CPU. glXWaitVideoSyncSGI does a real kernel-side wait,
-           so we sleep until the vblank fires. The pattern matches KWin's
-           SGIVideoSyncVsyncMonitor.
+        /* Block on the next vblank to put this thread to sleep in the
+           kernel. The swap above already does vsync if swap interval is 1,
+           but glXSwapBuffers's built-in wait on NVIDIA Tegra is a
+           sched_yield() spin loop that burns CPU. glXWaitVideoSyncSGI goes
+           through the kernel and the thread actually sleeps.
 
-           Skip the wait for non-FIFO present modes (where the app asked
-           for no pacing) and when SGI isn't available (in which case
-           glXSwapBuffers above did whatever vsync it was going to). */
+           Skip the wait for non-FIFO present modes (the app asked for no
+           pacing) and when SGI is not available. */
         if (sc->glXWaitVideoSyncSGI
             && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR
             && sc->present_mode != VK_PRESENT_MODE_MAILBOX_KHR) {
             unsigned int count = 0;
-            /* Wait for the next vblank: any count whose parity is opposite
-               the current. Equivalent to "the next time the vsync counter
-               increments". Per spec, divisor=2 remainder=(cur+1)&1 returns
-               on the next vblank regardless of where in the cycle we are. */
+            /* divisor=2 remainder=(cur+1)&1 returns on the next vblank
+               regardless of where in the cycle we are. */
             if (sc->glXGetVideoSyncSGI(&count) == 0) {
                 sc->glXWaitVideoSyncSGI(2, (count + 1) & 1, &count);
             } else {
-                /* Counter query failed; just ask for "next even vblank"
-                   which still gives us a wait. */
                 sc->glXWaitVideoSyncSGI(2, 0, &count);
             }
         }
@@ -1140,9 +1164,9 @@ static bool resolve_gl_funcs(Swapchain *sc) {
     sc->glXWaitVideoSyncSGI =
         (int (*)(int, int, unsigned*))glXGetProcAddressARB((const GLubyte*)"glXWaitVideoSyncSGI");
     if (sc->glXGetVideoSyncSGI && sc->glXWaitVideoSyncSGI) {
-        LOG_INFO("GLX_SGI_video_sync present; using glXWaitVideoSyncSGI for vsync pacing");
+        LOG_INFO("GLX_SGI_video_sync present; will sleep in glXWaitVideoSyncSGI between swaps");
     } else {
-        LOG_INFO("GLX_SGI_video_sync NOT present; falling back to glXSwapBuffers vsync");
+        LOG_INFO("GLX_SGI_video_sync NOT present; the worker thread may spin during glXSwapBuffers's built-in vsync wait");
     }
 #undef GLX
     if (!sc->glCreateMemoryObjectsEXT || !sc->glImportMemoryFdEXT || !sc->glTexStorageMem2DEXT
