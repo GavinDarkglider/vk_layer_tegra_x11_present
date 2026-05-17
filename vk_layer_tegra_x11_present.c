@@ -153,7 +153,9 @@
     M(XGetWindowAttributes, Status, (Display *, Window, XWindowAttributes *)) \
     M(XResizeWindow,     int,     (Display *, Window, unsigned, unsigned)) \
     M(XFlush,            int,     (Display *)) \
-    M(XChangeProperty,   int,     (Display *, Window, Atom, Atom, int, int, const unsigned char *, int))
+    M(XChangeProperty,   int,     (Display *, Window, Atom, Atom, int, int, const unsigned char *, int)) \
+    M(XGetSelectionOwner, Window, (Display *, Atom)) \
+    M(XGetWindowProperty, int,    (Display *, Window, Atom, long, long, Bool, Atom, Atom *, int *, unsigned long *, unsigned long *, unsigned char **))
 
 #define GL_FUNCS(M) \
     M(glGetError,                GLenum,  (void)) \
@@ -308,6 +310,8 @@ static bool lib_load(void) {
 #define XResizeWindow             (g_libs.XResizeWindow)
 #define XFlush                    (g_libs.XFlush)
 #define XChangeProperty           (g_libs.XChangeProperty)
+#define XGetSelectionOwner        (g_libs.XGetSelectionOwner)
+#define XGetWindowProperty        (g_libs.XGetWindowProperty)
 
 #define glGetError                (g_libs.glGetError)
 #define glClear                   (g_libs.glClear)
@@ -770,6 +774,10 @@ typedef struct Swapchain {
     VkFormat      format;
     VkColorSpaceKHR color_space;
     VkPresentModeKHR present_mode;
+    /* True if an X compositor was running when this swapchain was created.
+       Affects the swap-interval strategy and SGI vblank wait ordering in
+       the worker thread — see the big comment in the worker setup block. */
+    bool has_compositor;
     /* Usage flags the app requested for swapchain images. We honor these
        (OR'd with what we need ourselves) when creating our images. PPSSPP
        in particular asks for INPUT_ATTACHMENT_BIT for its subpass effects;
@@ -1059,32 +1067,41 @@ static void *worker_thread_main(void *arg) {
     }
 
     /* Swap interval strategy.
-       We always set interval 1 for FIFO present modes (the common case).
-       glXSwapBuffers then queues the swap to happen at the next vblank,
-       which is what actually prevents tearing on the active display —
-       essential when the output is going through DisplayPort to an
-       external monitor at an arbitrary refresh rate, where our worker's
-       loop pacing alone can't guarantee that pixels land between
-       scanouts. The driver-side swap-at-vblank is the only thing that
-       does that.
+       The right interval depends on whether a compositor is running:
 
-       Even with interval 1, we still call glXWaitVideoSyncSGI later in
-       the loop. That's not for tearing — the swap already handled that
-       — but to put the worker thread to sleep until the next vblank so
-       it doesn't burn CPU in glXSwapBuffers's sched_yield wait loop.
-       By the time we re-enter glXSwapBuffers next iteration, the
-       previous swap has already completed and the next swap is queued
-       immediately, so the sched_yield burst inside glXSwapBuffers is
-       brief.
+       WITH compositor (KWin etc.):
+         glXSwapBuffers(interval=1) blocks for ~1 full vblank while the
+         compositor takes ownership of the buffer.  If we then call
+         glXWaitVideoSyncSGI we consume a second vblank — 30Hz total.
+         Fix: use interval 0 so glXSwapBuffers returns immediately; the
+         SGI wait BEFORE the swap (see the worker loop) provides the
+         single vblank gate.  The compositor's own vsync pipeline
+         guarantees tear-free presentation regardless of our interval.
 
-       Present modes that explicitly want no vsync (IMMEDIATE) get
-       interval 0; FIFO_RELAXED gets late-tearing -1 if the driver
-       supports it. */
+       WITHOUT compositor (Lakka, direct-to-display):
+         glXSwapBuffers(interval=1) is an async DRM flip that returns
+         immediately without consuming a vblank on our thread; the SGI
+         wait AFTER the swap is the only vblank gate, giving 60Hz.
+         We must keep interval=1 here — interval=0 without a compositor
+         means no vsync gating at the driver level and causes tearing.
+
+       IMMEDIATE: always interval 0 (app wants no pacing whatsoever).
+       MAILBOX: same interval as FIFO. MAILBOX is "non-blocking producer
+       + vsync-paced consumer", not "no vsync at all" — only the
+       producer-side blocking is removed (handled in worker_post via the
+       displaced_idx mechanism).
+       FIFO_RELAXED: -1 (late-tearing) without compositor, 0 with. */
     if (sc->glXSwapIntervalEXT) {
-        int interval = 1;
-        if (sc->present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) interval = 0;
-        else if (sc->present_mode == VK_PRESENT_MODE_MAILBOX_KHR) interval = 0;
-        else if (sc->present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) interval = -1;
+        int interval;
+        if (sc->present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+            interval = 0;
+        } else if (sc->present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) {
+            interval = sc->has_compositor ? 0 : -1;
+        } else {
+            /* FIFO and MAILBOX: 0 with compositor (SGI before swap gates
+               vblank), 1 without (driver-side vsync, no double-wait). */
+            interval = sc->has_compositor ? 0 : 1;
+        }
         sc->glXSwapIntervalEXT(sc->worker_dpy, sc->child_window, interval);
     }
 
@@ -1142,50 +1159,77 @@ static void *worker_thread_main(void *arg) {
         sc->glSignalSemaphoreEXT(sc->images[idx].gl_sample_sem, 0, NULL,
                                  1, &sc->images[idx].gl_texture, dstLayouts);
         /* glFinish forces all queued GL commands (including the sample draw
-           above) to actually complete on the GPU before we proceed. With
-           glFlush alone, glXSwapBuffers may queue the swap before the sample
-           draw has finished, and the driver's swap-at-vblank logic can race
-           with our rendering. On the docked HDMI output specifically, this
-           manifests as a slowly-drifting tear line even with swap interval 1.
+           above) to actually complete on the GPU before we proceed. Without
+           it the draw may still be in flight when we reach glXSwapBuffers,
+           and on the docked HDMI output this races with the display
+           controller and manifests as a slowly-drifting tear line.
            glFinish closes that race at the cost of one CPU stall per frame —
            the stall is short because the sample draw is a single textured
            quad. */
         glFinish();
-        glXSwapBuffers(sc->worker_dpy, sc->child_window);
-        /* Force the X server to actually process the swap request now,
-           rather than batching it with whatever happens later. Without this,
-           the swap can sit in the Xlib output buffer until the next request
-           flushes it, which on some Tegra X configurations races with the
-           vblank we then wait for via glXWaitVideoSyncSGI. */
-        XFlush(sc->worker_dpy);
 
-        /* Block on the next vblank to put this thread to sleep in the
-           kernel. The swap above already does vsync if swap interval is 1,
-           but glXSwapBuffers's built-in wait on NVIDIA Tegra is a
-           sched_yield() spin loop that burns CPU. glXWaitVideoSyncSGI goes
-           through the kernel and the thread actually sleeps.
+        /* Present and vblank synchronisation.
+           The right ordering of glXSwapBuffers and glXWaitVideoSyncSGI
+           depends on whether a compositor is running (see the swap-interval
+           comment in the worker setup block above for the full rationale).
 
-           Skip the wait for non-FIFO present modes (the app asked for no
-           pacing) and when SGI is not available. */
-        if (sc->glXWaitVideoSyncSGI
-            && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR
-            && sc->present_mode != VK_PRESENT_MODE_MAILBOX_KHR) {
+           WITH compositor: SGI wait → capture time → swap (interval 0).
+             The compositor's pipeline causes glXSwapBuffers(interval=1) to
+             block for ~1 vblank, so calling SGI afterwards would double-wait
+             and halve throughput to 30Hz.  With interval 0 the swap returns
+             immediately; the SGI wait before it is the single vblank gate.
+
+           WITHOUT compositor: swap (interval 1) → SGI wait → capture time.
+             glXSwapBuffers returns quickly here (async DRM flip), so the SGI
+             wait after is the only vblank gate — no double-wait, 60Hz. */
+
+        /* Whether to do the SGI vblank wait at all.
+
+           IMMEDIATE: no, the app asked for no pacing.
+
+           MAILBOX: yes. The mailbox semantic is about the *producer*
+           not blocking when a previous present is still pending; the
+           consumer (us) still paces presentation at the display
+           refresh rate, displaying the most-recent posted image at
+           each refresh. Producer-side non-blocking is handled in
+           worker_post via the displaced_idx mechanism.
+
+           FIFO / FIFO_RELAXED: yes. */
+        bool do_sgi = sc->glXWaitVideoSyncSGI
+                      && sc->present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR;
+
+        uint64_t actual_ns = 0;
+
+        if (do_sgi && sc->has_compositor) {
+            /* Compositor path: gate on vblank, capture time, then swap. */
             unsigned int count = 0;
-            /* divisor=2 remainder=(cur+1)&1 returns on the next vblank
-               regardless of where in the cycle we are. */
-            if (sc->glXGetVideoSyncSGI(&count) == 0) {
+            if (sc->glXGetVideoSyncSGI(&count) == 0)
                 sc->glXWaitVideoSyncSGI(2, (count + 1) & 1, &count);
-            } else {
+            else
                 sc->glXWaitVideoSyncSGI(2, 0, &count);
-            }
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            actual_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
         }
 
-        /* Capture actual present time right after vblank for
-           VK_GOOGLE_display_timing reporting. CLOCK_MONOTONIC matches
-           the clock domain the spec calls "any user-defined timeline"
-           and is what most apps that consume this extension assume. */
-        uint64_t actual_ns;
-        {
+        glXSwapBuffers(sc->worker_dpy, sc->child_window);
+        /* Push the swap request out of Xlib's output buffer immediately so
+           it reaches the X server before the vblank window closes. */
+        XFlush(sc->worker_dpy);
+
+        if (do_sgi && !sc->has_compositor) {
+            /* Direct path: gate on vblank after the swap, then capture time. */
+            unsigned int count = 0;
+            if (sc->glXGetVideoSyncSGI(&count) == 0)
+                sc->glXWaitVideoSyncSGI(2, (count + 1) & 1, &count);
+            else
+                sc->glXWaitVideoSyncSGI(2, 0, &count);
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            actual_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        }
+
+        /* Fallback timing for modes with no SGI wait (IMMEDIATE, MAILBOX,
+           or SGI extension absent): capture after the swap. */
+        if (actual_ns == 0) {
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
             actual_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
         }
@@ -1256,25 +1300,59 @@ static void *worker_thread_main(void *arg) {
     return NULL;
 }
 
-/* Post an image index to the worker's pending slot. Blocks if the slot is
-   currently full, which provides natural backpressure.
+/* Post an image index to the worker's pending slot.
 
-   present_id and desired_ns come from a VkPresentTimesInfoGOOGLE pNext on
-   the app's VkPresentInfoKHR; both zero when the app isn't using the
-   display-timing extension. The worker uses these to populate
-   VK_GOOGLE_display_timing history entries after the present completes. */
+   Behavior depends on the swapchain's present mode:
+
+   - FIFO / FIFO_RELAXED (the default): blocks the caller if the slot is
+     full. This is what gives us natural backpressure — the app's render
+     loop is paced by the worker's swap rate. The function returns
+     UINT32_MAX in *displaced_idx.
+
+   - MAILBOX: replaces the slot contents without blocking. If the slot
+     was already occupied, the previously-pending image index is
+     returned via *displaced_idx so the caller can do the bookkeeping
+     needed for a dropped frame (consume the dropped image's
+     vk_render_done semaphore, signal its gl_sample_done so the next
+     Acquire on it doesn't block). If the slot was empty, returns
+     UINT32_MAX in *displaced_idx.
+
+   present_id and desired_ns come from VkPresentTimesInfoGOOGLE on the
+   app's VkPresentInfoKHR pNext; both zero when the app isn't using
+   display-timing. The worker uses these to populate
+   VK_GOOGLE_display_timing history. */
 static void worker_post(Swapchain *sc, uint32_t idx,
-                        uint32_t present_id, uint64_t desired_ns) {
+                        uint32_t present_id, uint64_t desired_ns,
+                        uint32_t *displaced_idx) {
+    bool is_mailbox = (sc->present_mode == VK_PRESENT_MODE_MAILBOX_KHR);
+    uint32_t displaced = UINT32_MAX;
+
     pthread_mutex_lock(&sc->worker_lock);
-    while (sc->worker_pending && sc->worker_running)
-        pthread_cond_wait(&sc->worker_cv_done, &sc->worker_lock);
-    if (!sc->worker_running) { pthread_mutex_unlock(&sc->worker_lock); return; }
+
+    if (!is_mailbox) {
+        /* FIFO path: block until slot is free. */
+        while (sc->worker_pending && sc->worker_running)
+            pthread_cond_wait(&sc->worker_cv_done, &sc->worker_lock);
+    } else if (sc->worker_pending) {
+        /* MAILBOX path: a previous present hasn't been picked up yet.
+           Replace it; the caller will handle the displaced image's
+           semaphore cleanup. */
+        displaced = sc->worker_pending_idx;
+    }
+
+    if (!sc->worker_running) {
+        pthread_mutex_unlock(&sc->worker_lock);
+        if (displaced_idx) *displaced_idx = UINT32_MAX;
+        return;
+    }
     sc->worker_pending = true;
     sc->worker_pending_idx = idx;
     sc->worker_pending_present_id = present_id;
     sc->worker_pending_desired_ns = desired_ns;
     pthread_cond_signal(&sc->worker_cv_pending);
     pthread_mutex_unlock(&sc->worker_lock);
+
+    if (displaced_idx) *displaced_idx = displaced;
 }
 
 /* Tell the worker to exit and join the thread. */
@@ -1605,13 +1683,6 @@ static void destroy_perimage(DevNode *dev, Swapchain *sc, PerImage *pi) {
 /* Surface bypass-compositor hint                                          */
 /* ----------------------------------------------------------------------- */
 
-static void set_bypass_compositor(Display *dpy, Window win) {
-    Atom prop = XInternAtom(dpy, "_NET_WM_BYPASS_COMPOSITOR", False);
-    long val = 1;
-    XChangeProperty(dpy, win, prop, XA_CARDINAL, 32, PropModeReplace,
-                    (unsigned char*)&val, 1);
-}
-
 /* ----------------------------------------------------------------------- */
 /* Surface hooks                                                           */
 /* ----------------------------------------------------------------------- */
@@ -1625,8 +1696,10 @@ layer_CreateXlibSurfaceKHR(VkInstance instance,
         InstNode *in = inst_lookup(dispatch_key(instance));
         return in->d.CreateXlibSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
     }
-    /* set_bypass_compositor below uses XInternAtom and XChangeProperty.
-       Ensure libX11 is dlopen'd before we call them. */
+    /* Surface query functions (GetPhysicalDeviceSurfaceCapabilitiesKHR etc.)
+       call XGetGeometry and other X11 functions via g_libs.* pointers that
+       are only populated by lib_load().  Those queries can arrive before
+       CreateSwapchainKHR, so we must load the libraries here. */
     if (!lib_load()) {
         InstNode *in = inst_lookup(dispatch_key(instance));
         return in->d.CreateXlibSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
@@ -1638,7 +1711,6 @@ layer_CreateXlibSurfaceKHR(VkInstance instance,
     s->dpy = pCreateInfo->dpy;
     s->window = pCreateInfo->window;
     s->owns_dpy = false;
-    set_bypass_compositor(s->dpy, s->window);
     *pSurface = (VkSurfaceKHR)(uintptr_t)s;
     LOG_INFO("CreateXlibSurfaceKHR -> surface=%p dpy=%p win=0x%lx", s, s->dpy, s->window);
     return VK_SUCCESS;
@@ -1653,14 +1725,14 @@ layer_CreateXcbSurfaceKHR(VkInstance instance,
         InstNode *in = inst_lookup(dispatch_key(instance));
         return in->d.CreateXcbSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
     }
-    /* Make sure libX11 is loaded (we use XOpenDisplay/XInternAtom/XChangeProperty
-       below). See lib_load() for why this is deferred from layer init. */
+    /* XCB-only apps don't give us an Xlib Display*. We need one for GLX
+       (GLX is Xlib-bound). Open our own Display* over the same X server.
+       lib_load() is deferred to CreateSwapchain; XOpenDisplay is resolved
+       there too, so for the XCB path we load it eagerly here. */
     if (!lib_load()) {
         InstNode *in = inst_lookup(dispatch_key(instance));
         return in->d.CreateXcbSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
     }
-    /* XCB-only apps don't give us an Xlib Display*. We need one for GLX
-       (GLX is Xlib-bound). Open our own Display* over the same X server. */
     Surface *s = calloc(1, sizeof(*s));
     if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
     s->magic = SURFACE_MAGIC;
@@ -1669,7 +1741,6 @@ layer_CreateXcbSurfaceKHR(VkInstance instance,
     if (!s->dpy) { free(s); return VK_ERROR_INITIALIZATION_FAILED; }
     s->owns_dpy = true;
     s->window = pCreateInfo->window;
-    set_bypass_compositor(s->dpy, s->window);
     *pSurface = (VkSurfaceKHR)(uintptr_t)s;
     LOG_INFO("CreateXcbSurfaceKHR -> surface=%p dpy=%p (opened) win=0x%x",
              s, s->dpy, pCreateInfo->window);
@@ -1915,6 +1986,62 @@ layer_CreateSwapchainKHR(VkDevice device,
     }
 
     int screen = DefaultScreen(surf->dpy);
+
+    /* Detect whether an X compositor is actively compositing this window.
+       Two conditions must both hold:
+
+       1. A compositor is running: the ICCCM convention is that any
+          compositor that owns a screen claims the selection
+          "_NET_WM_CM_S<screen>".  If that atom exists and has an owner,
+          a compositor is present.
+
+       2. The window is not bypassing the compositor: if the app (or we
+          ourselves) set _NET_WM_BYPASS_COMPOSITOR=1 on the surface
+          window, KWin and other compositors stop managing that window and
+          give it direct scanout — identical presentation behaviour to
+          running without a compositor at all.  In that case we must use
+          the no-compositor vsync path (interval=1, SGI after swap) even
+          though the compositor selection is still owned.
+
+       This affects the worker's vsync strategy — see the swap-interval
+       comment in the worker setup block for the full rationale. */
+    {
+        char sel_name[32];
+        snprintf(sel_name, sizeof(sel_name), "_NET_WM_CM_S%d", screen);
+        Atom sel = XInternAtom(surf->dpy, sel_name, True /* only_if_exists */);
+        sc->has_compositor = (sel != None && XGetSelectionOwner(surf->dpy, sel) != None);
+
+        if (sc->has_compositor) {
+            /* Check whether the app has asked the compositor to bypass
+               this window (direct scanout).  If so, the compositor is
+               not compositing us and we must treat it as absent. */
+            Atom bypass_atom = XInternAtom(surf->dpy, "_NET_WM_BYPASS_COMPOSITOR",
+                                           True /* only_if_exists */);
+            if (bypass_atom != None) {
+                Atom actual_type = None; int actual_fmt = 0;
+                unsigned long nitems = 0, bytes_after = 0;
+                unsigned char *data = NULL;
+                int rc = XGetWindowProperty(surf->dpy, surf->window,
+                                            bypass_atom, 0, 1, False,
+                                            XA_CARDINAL, &actual_type, &actual_fmt,
+                                            &nitems, &bytes_after, &data);
+                /* Only dereference when the property actually exists and
+                   holds at least one 32-bit CARDINAL value.  Xlib returns
+                   Success with nitems=0 (and a non-NULL prop_return that
+                   still must be freed) when the property is absent — reading
+                   past that zero-byte buffer is undefined behaviour. */
+                if (rc == Success && data && nitems >= 1
+                    && actual_type == XA_CARDINAL && actual_fmt == 32) {
+                    long val = *(long *)data;
+                    if (val == 1)
+                        sc->has_compositor = false;
+                }
+                if (data) XFree(data);
+            }
+        }
+
+        LOG_INFO("compositor: %s", sc->has_compositor ? "active" : "none/bypassed");
+    }
 
     /* Query the app's window depth so we can prefer a matching FBConfig.
        If the app's window is 32-bit RGBA (Chromium, GTK CSD apps, etc.),
@@ -2606,8 +2733,11 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
         }
 
         /* The GL side runs in the worker thread which owns the GLX context.
-           This call may block if the worker's single-slot queue is still
-           full, providing natural backpressure. */
+           In FIFO mode this call blocks if the worker is still busy with
+           the previous image — that's the natural backpressure point.
+           In MAILBOX mode this call returns immediately and reports back
+           the index of any image whose place we just took, so we can
+           clean up its dangling semaphores before the next iteration. */
         sc->images[idx].acquired = false;
         pthread_mutex_unlock(&sc->lock);
 
@@ -2617,7 +2747,48 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
             present_id = times_info->pTimes[s].presentID;
             desired_ns = times_info->pTimes[s].desiredPresentTime;
         }
-        worker_post(sc, idx, present_id, desired_ns);
+        uint32_t displaced_idx = UINT32_MAX;
+        worker_post(sc, idx, present_id, desired_ns, &displaced_idx);
+
+        /* MAILBOX drop bookkeeping. If worker_post returned a displaced
+           index, that image was Presented earlier but its turn at the
+           GLX swap never came. Two things need to happen for its state
+           to be consistent for future use:
+
+             1. Consume its vk_render_done semaphore. We had already
+                signalled it via the bridge submit for that earlier
+                Present. The worker would normally consume it via
+                glWaitSemaphoreEXT during its loop iteration; since
+                that iteration is skipped we have to consume here, or
+                a future Present's bridge submit attempting to signal
+                the same binary semaphore is undefined behaviour.
+
+             2. Signal its gl_sample_done semaphore. The next time the
+                app calls Acquire on this image, the acquire bridge
+                waits on gl_sample_done. Without us signalling it the
+                app would deadlock waiting for a frame that never
+                actually rendered.
+
+           One bridge submit handles both. The wait/signal happen on
+           the queue serially with no actual GPU work between them; the
+           submit returns fast. */
+        if (displaced_idx != UINT32_MAX) {
+            VkPipelineStageFlags drop_stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+            VkSubmitInfo drop_si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+            drop_si.waitSemaphoreCount   = 1;
+            drop_si.pWaitSemaphores      = &sc->images[displaced_idx].vk_render_done;
+            drop_si.pWaitDstStageMask    = &drop_stage;
+            drop_si.signalSemaphoreCount = 1;
+            drop_si.pSignalSemaphores    = &sc->images[displaced_idx].gl_sample_done;
+            VkResult rd = queue_submit_locked(dev, queue, 1, &drop_si, VK_NULL_HANDLE);
+            if (rd != VK_SUCCESS) {
+                LOG_ERR("QueuePresentKHR: mailbox drop cleanup submit failed: %d "
+                        "(displaced_idx=%u)", rd, displaced_idx);
+                /* Don't propagate to the app — the present that displaced
+                   this one is still in flight and is what the app actually
+                   wanted. Best effort. */
+            }
+        }
 
         if (pInfo->pResults) pInfo->pResults[s] = VK_SUCCESS;
     }

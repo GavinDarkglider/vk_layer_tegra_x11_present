@@ -271,7 +271,7 @@ The Lakka build recipe does this automatically.
 
 ## Known issues / planned
 
-The layer is shipped as v3.0; the items below are scoped for future
+The layer is shipped as v3.1; the items below are scoped for future
 v3.x iterations.
 
 - **PPSSPP libretro core (some titles)** — pending v3.x. Some titles
@@ -291,27 +291,52 @@ v3.x iterations.
   if those don't reveal the issue, build a validation-layer-enabled
   developer image to capture VUIDs.
 
-- **MAILBOX present mode is degenerate** — pending v3.x. Apps that
-  request `VK_PRESENT_MODE_MAILBOX_KHR` expect to never block in
-  `vkQueuePresentKHR` — new presents replace any unconsumed earlier
-  ones in a single-deep mailbox slot, oldest dropped. Our current
-  worker still uses the same single-slot mailbox as FIFO, so the app
-  still blocks when the slot is full, and we skip vsync without the
-  benefit of the drop-old-take-newest semantics. Apps that genuinely
-  rely on MAILBOX latency characteristics (some game engines that
-  want to render as fast as the GPU can but display at vsync) won't
-  see the behavior they expect. Plan: give the worker a proper
-  drop-old mailbox path for this mode — replace the contents of
-  `worker_pending_idx` instead of blocking the producer, and free
-  the displaced image's resources back to the acquire pool. The
-  acquire-side semaphore bridging needs to handle the dropped image
-  cleanly too — the app's render-done semaphore for the dropped frame
-  must still get consumed somewhere, or the next submit waiting on it
-  will hang.
+## Done in v3.1
+
+- **`VK_PRESENT_MODE_MAILBOX_KHR` now has the right semantics.** The
+  worker's mailbox accepts new presents non-blockingly: when a present
+  arrives while the slot still has a previous unconsumed image, the
+  new image replaces the old one and the caller is told which image
+  was displaced. The caller then issues a one-shot cleanup bridge
+  submit that consumes the displaced image's `vk_render_done`
+  semaphore (which had already been signalled for the dropped frame)
+  and signals its `gl_sample_done` semaphore so the next Acquire of
+  that image succeeds.
+
+  FIFO mode is unchanged — still blocks the producer when the slot
+  is full, which is the right behaviour for vsync-locked apps.
+
+  The worker still paces presentation at vblank rate in MAILBOX
+  mode. MAILBOX changes only the *producer-side blocking* behaviour;
+  the consumer still presents one image per display refresh.
+
+- **Compositor-aware vsync strategy.** Previously the layer always
+  used `glXSwapBuffers(interval=1)` followed by `glXWaitVideoSyncSGI`.
+  Under a running X compositor (KWin, Mutter, picom etc.) the
+  interval-1 swap blocks for a full vblank while the compositor takes
+  ownership of the buffer, and the SGI wait then consumes a second
+  vblank — net throughput 30 Hz instead of 60 Hz.
+
+  v3.1 detects whether a compositor is running by querying the EWMH
+  `_NET_WM_CM_S<N>` selection at swapchain creation, and also checks
+  whether the window has `_NET_WM_BYPASS_COMPOSITOR=1` set (compositor
+  steps aside; treat as direct).
+
+  With compositor: `interval=0` swap, SGI wait *before* the swap →
+  one vblank gate, 60 Hz, compositor handles its own pipeline.
+
+  Without compositor: `interval=1` swap, SGI wait *after* the swap →
+  driver-side vsync gates the swap, SGI sleep keeps CPU low, 60 Hz.
+
+  The previous `set_bypass_compositor` call has been removed: we now
+  cooperate with the compositor properly so window shadows, blur, and
+  CSD decorations work as expected on desktop deployments. Apps that
+  want direct scanout can still set `_NET_WM_BYPASS_COMPOSITOR=1`
+  themselves; the layer respects that.
 
 ## Done in v3.0
 
-- **`VK_GOOGLE_display_timing`** is now implemented. Apps that use the
+- **`VK_GOOGLE_display_timing`** is implemented. Apps that use the
   extension to compute frame-drop metrics (Chromium, GeForce NOW
   client, some game engines) receive accurate per-present timing data
   instead of falling back to the over-reporting heuristic.
