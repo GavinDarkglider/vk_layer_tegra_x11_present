@@ -150,6 +150,7 @@
     M(XFree,             int,     (void *)) \
     M(XMapWindow,        int,     (Display *, Window)) \
     M(XGetGeometry,      Status,  (Display *, Drawable, Window *, int *, int *, unsigned *, unsigned *, unsigned *, unsigned *)) \
+    M(XGetWindowAttributes, Status, (Display *, Window, XWindowAttributes *)) \
     M(XResizeWindow,     int,     (Display *, Window, unsigned, unsigned)) \
     M(XFlush,            int,     (Display *)) \
     M(XChangeProperty,   int,     (Display *, Window, Atom, Atom, int, int, const unsigned char *, int))
@@ -303,6 +304,7 @@ static bool lib_load(void) {
 #define XFree                     (g_libs.XFree)
 #define XMapWindow                (g_libs.XMapWindow)
 #define XGetGeometry              (g_libs.XGetGeometry)
+#define XGetWindowAttributes      (g_libs.XGetWindowAttributes)
 #define XResizeWindow             (g_libs.XResizeWindow)
 #define XFlush                    (g_libs.XFlush)
 #define XChangeProperty           (g_libs.XChangeProperty)
@@ -896,7 +898,21 @@ static void untrack_swapchain(Swapchain *sc);
    that's a problem the app already solved at window creation time — the
    window has SOME visual, and we ask GLX to find a doublebuffered RGBA
    FBConfig of equivalent depth. */
-static GLXFBConfig pick_fbconfig(Display *dpy, int screen, VkFormat fmt, XVisualInfo **out_vi) {
+/* Pick a doublebuffered RGBA GLX framebuffer config. We prefer one whose
+   X visual depth is 32 — that's the ARGB visual that compositors will
+   alpha-blend with the desktop. With a 24-bit visual the X server treats
+   the window as opaque regardless of how much alpha we render into it,
+   which manifests as black borders around apps that use CSD shadows
+   (Chromium, GTK3/4 client-side-decorated apps, Electron, etc.). If a
+   32-bit visual isn't available we accept any RGBA FBConfig and let the
+   compositor render the window opaquely.
+
+   parent_depth, if nonzero, is a preference toward matching the X parent
+   window's visual depth — if the app's window is depth 24 there's no
+   compositor blending to preserve and the simpler/faster 24-bit visual
+   is fine. */
+static GLXFBConfig pick_fbconfig(Display *dpy, int screen, VkFormat fmt,
+                                 int parent_depth, XVisualInfo **out_vi) {
     int red=8, green=8, blue=8, alpha=8;
     /* SRGB needs GLX_FRAMEBUFFER_SRGB_CAPABLE_ARB. */
     bool want_srgb = (fmt == VK_FORMAT_R8G8B8A8_SRGB || fmt == VK_FORMAT_B8G8R8A8_SRGB);
@@ -926,8 +942,42 @@ static GLXFBConfig pick_fbconfig(Display *dpy, int screen, VkFormat fmt, XVisual
         }
     }
     if (!fbs || nfb == 0) return NULL;
+
+    /* Search returned FBConfigs for one whose visual matches the parent
+       window's depth (if specified) or is depth 32 (preferred for
+       compositor alpha blending). Fall back to the first FBConfig if no
+       match. */
     GLXFBConfig pick = fbs[0];
-    *out_vi = glXGetVisualFromFBConfig(dpy, pick);
+    XVisualInfo *pick_vi = glXGetVisualFromFBConfig(dpy, pick);
+    int want_depth = (parent_depth == 32 || parent_depth == 24) ? parent_depth : 32;
+    for (int i = 0; i < nfb; i++) {
+        XVisualInfo *vi = glXGetVisualFromFBConfig(dpy, fbs[i]);
+        if (!vi) continue;
+        if (vi->depth == want_depth) {
+            if (pick_vi) XFree(pick_vi);
+            pick = fbs[i];
+            pick_vi = vi;
+            break;
+        }
+        XFree(vi);
+    }
+    /* If nothing matched our preferred depth, fall back to ANY 32-bit
+       visual — the compositor case is more important than matching the
+       parent's depth exactly. */
+    if (pick_vi && pick_vi->depth != want_depth && want_depth != 32) {
+        for (int i = 0; i < nfb; i++) {
+            XVisualInfo *vi = glXGetVisualFromFBConfig(dpy, fbs[i]);
+            if (!vi) continue;
+            if (vi->depth == 32) {
+                XFree(pick_vi);
+                pick = fbs[i];
+                pick_vi = vi;
+                break;
+            }
+            XFree(vi);
+        }
+    }
+    *out_vi = pick_vi;
     XFree(fbs);
     return pick;
 }
@@ -1769,12 +1819,27 @@ layer_CreateSwapchainKHR(VkDevice device,
     }
 
     int screen = DefaultScreen(surf->dpy);
-    sc->fbcfg = pick_fbconfig(surf->dpy, screen, sc->format, &sc->visinfo);
+
+    /* Query the app's window depth so we can prefer a matching FBConfig.
+       If the app's window is 32-bit RGBA (Chromium, GTK CSD apps, etc.),
+       we want our child window to also be 32-bit RGBA so the compositor
+       can blend its translucent regions properly. If the app's window is
+       24-bit, a 24-bit FBConfig is fine. */
+    int parent_depth = 0;
+    {
+        XWindowAttributes pwa = {0};
+        if (XGetWindowAttributes(surf->dpy, surf->window, &pwa)) {
+            parent_depth = pwa.depth;
+        }
+    }
+
+    sc->fbcfg = pick_fbconfig(surf->dpy, screen, sc->format, parent_depth, &sc->visinfo);
     if (!sc->fbcfg || !sc->visinfo) {
         LOG_ERR("pick_fbconfig: no suitable FBConfig for format %d", sc->format);
         free(sc);
         return dev->d.CreateSwapchainKHR(device, ci, pAlloc, pOut);
     }
+    LOG_INFO("FBConfig visual: depth=%d (parent depth=%d)", sc->visinfo->depth, parent_depth);
 
     /* Create the GLX child window inside the app's surface window. We use
        our own visual (from the FBConfig) so GLX is happy. The app's window

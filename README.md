@@ -269,14 +269,69 @@ The Lakka build recipe does this automatically.
 - An NVIDIA Tegra Vulkan ICD (or any ICD that supports the OPAQUE_FD
   external memory/semaphore extensions and `GLX_SGI_video_sync`)
 
-## Known issues
+## Known issues / planned for v3
 
 - **PPSSPP libretro core (some titles).** Some titles trigger a GPU
-  fault in PPSSPP's render path that returns `VK_ERROR_DEVICE_LOST` from
-  a later `vkQueueSubmit`. Without validation layers on Lakka we can't
-  pinpoint the offending command. Simple titles work fine; complex
-  titles with heavy post-processing don't. Use
-  `VK_TEGRA_X11_PRESENT_DIAG=1` to narrow down which submit faults.
+  fault in PPSSPP's render path that returns `VK_ERROR_DEVICE_LOST`
+  from a later `vkQueueSubmit`. The crash signature is consistent
+  across titles: a few frame submits succeed, then a secondary
+  command-buffer submit (no semaphores, just a fence) faults. We
+  suspect a code path in our layer mishandles something PPSSPP does
+  that simpler apps don't — possibly a layout transition on a
+  command-buffer path we don't intercept (`vkCmdCopyImageToBuffer`,
+  `vkCmdBlitImage`, render passes with `VK_KHR_synchronization2`
+  barriers), or a usage-flag the swapchain image needs but we don't
+  provide. Without validation layers available on the deployment
+  targets we can't pinpoint the offending command. v3 work will:
+  intercept the remaining command-buffer entry points that take
+  layouts; verify usage flag plumbing against PPSSPP's actual
+  swapchain create info; if those don't reveal the issue, build a
+  validation-layer-enabled developer image to capture VUIDs.
+
+- **Chromium / video apps report dropped frames in their telemetry.**
+  Chromium and similar apps use `VK_GOOGLE_display_timing` (and the
+  newer `VK_KHR_present_id` / `VK_KHR_present_wait`) to compute their
+  dropped-frames metric. This layer doesn't implement those
+  extensions, so apps fall back to a heuristic that over-reports drops.
+  Actual visible playback is unaffected — only the metric is wrong.
+  v3 will add `VK_GOOGLE_display_timing` at minimum (the older, more
+  widely-supported extension) and probably `VK_KHR_present_id` /
+  `VK_KHR_present_wait` as well. Implementation needs the worker to
+  track per-present completion timestamps (already available; we just
+  need to retain a small history) and to plumb wait/signal IDs through
+  the bridge submit chain.
+
+- **MAILBOX present mode is degenerate.** Apps that request
+  `VK_PRESENT_MODE_MAILBOX_KHR` expect to never block in
+  `vkQueuePresentKHR` — new presents replace any unconsumed earlier
+  ones in a single-deep mailbox slot, oldest dropped. Our current
+  worker still uses the same single-slot mailbox as FIFO, so the app
+  still blocks when the slot is full, and we skip vsync without the
+  benefit of the drop-old-take-newest semantics. Apps that genuinely
+  rely on MAILBOX latency characteristics (some game engines that
+  want to render as fast as the GPU can but display at vsync) won't
+  see the behavior they expect. v3 will give the worker a proper
+  drop-old mailbox path for this mode: replace the contents of
+  `worker_pending_idx` instead of blocking the producer, and free
+  the displaced image's resources back to the acquire pool. The
+  acquire-side semaphore bridging needs to handle the dropped image
+  cleanly too — the app's render-done semaphore for the dropped
+  frame must still get consumed somewhere, or the next submit waiting
+  on it will hang.
+
+## Alpha and compositor blending
+
+For apps with client-side decorations and translucent shadows (Chromium,
+Electron, GTK3/4 CSD apps, Qt apps with native blur, etc.), the layer
+needs to present an RGBA window that the X compositor can alpha-blend.
+`pick_fbconfig` picks a 32-bit ARGB visual when one is available, and
+the fragment shader writes the full RGBA from the Vulkan-rendered image
+so the alpha channel is preserved through the GL→GLX→X-server pipeline.
+
+If a 32-bit visual isn't available (rare; almost all NVIDIA GLX
+configurations expose one), the layer falls back to a 24-bit RGB visual
+— the window will be opaque and any CSD shadow region will show as
+opaque black. The actual rendering is unaffected.
 
 ## Files
 
