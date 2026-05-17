@@ -5,12 +5,17 @@
         "type": "GLOBAL",
         "library_path": "libVkLayer_tegra_x11_present.so",
         "api_version": "1.1.85",
-        "implementation_version": "2",
+        "implementation_version": "3",
         "description": "Tegra L4T r32.x Vulkan->GL X11 present relay. Routes Vulkan WSI presentation through GL/GLX to obtain vsync-locked, tear-free presentation on a driver whose native Vulkan WSI does not. Set VK_TEGRA_X11_PRESENT_DISABLE=1 to bypass.",
         "disable_environment": {
             "VK_TEGRA_X11_PRESENT_DISABLE": "1"
         },
         "instance_extensions": [],
-        "device_extensions": []
+        "device_extensions": [
+            {
+                "name": "VK_GOOGLE_display_timing",
+                "spec_version": "1"
+            }
+        ]
     }
 }

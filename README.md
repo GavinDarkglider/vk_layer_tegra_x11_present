@@ -269,40 +269,30 @@ The Lakka build recipe does this automatically.
 - An NVIDIA Tegra Vulkan ICD (or any ICD that supports the OPAQUE_FD
   external memory/semaphore extensions and `GLX_SGI_video_sync`)
 
-## Known issues / planned for v3
+## Known issues / planned
 
-- **PPSSPP libretro core (some titles).** Some titles trigger a GPU
-  fault in PPSSPP's render path that returns `VK_ERROR_DEVICE_LOST`
-  from a later `vkQueueSubmit`. The crash signature is consistent
-  across titles: a few frame submits succeed, then a secondary
-  command-buffer submit (no semaphores, just a fence) faults. We
-  suspect a code path in our layer mishandles something PPSSPP does
-  that simpler apps don't — possibly a layout transition on a
-  command-buffer path we don't intercept (`vkCmdCopyImageToBuffer`,
+The layer is shipped as v3.0; the items below are scoped for future
+v3.x iterations.
+
+- **PPSSPP libretro core (some titles)** — pending v3.x. Some titles
+  trigger a GPU fault in PPSSPP's render path that returns
+  `VK_ERROR_DEVICE_LOST` from a later `vkQueueSubmit`. The crash
+  signature is consistent across titles: a few frame submits succeed,
+  then a secondary command-buffer submit (no semaphores, just a fence)
+  faults. We suspect a code path in our layer mishandles something
+  PPSSPP does that simpler apps don't — possibly a layout transition on
+  a command-buffer path we don't intercept (`vkCmdCopyImageToBuffer`,
   `vkCmdBlitImage`, render passes with `VK_KHR_synchronization2`
   barriers), or a usage-flag the swapchain image needs but we don't
   provide. Without validation layers available on the deployment
-  targets we can't pinpoint the offending command. v3 work will:
-  intercept the remaining command-buffer entry points that take
-  layouts; verify usage flag plumbing against PPSSPP's actual
-  swapchain create info; if those don't reveal the issue, build a
-  validation-layer-enabled developer image to capture VUIDs.
+  targets we can't pinpoint the offending command. Plan: intercept the
+  remaining command-buffer entry points that take layouts; verify
+  usage flag plumbing against PPSSPP's actual swapchain create info;
+  if those don't reveal the issue, build a validation-layer-enabled
+  developer image to capture VUIDs.
 
-- **Chromium / video apps report dropped frames in their telemetry.**
-  Chromium and similar apps use `VK_GOOGLE_display_timing` (and the
-  newer `VK_KHR_present_id` / `VK_KHR_present_wait`) to compute their
-  dropped-frames metric. This layer doesn't implement those
-  extensions, so apps fall back to a heuristic that over-reports drops.
-  Actual visible playback is unaffected — only the metric is wrong.
-  v3 will add `VK_GOOGLE_display_timing` at minimum (the older, more
-  widely-supported extension) and probably `VK_KHR_present_id` /
-  `VK_KHR_present_wait` as well. Implementation needs the worker to
-  track per-present completion timestamps (already available; we just
-  need to retain a small history) and to plumb wait/signal IDs through
-  the bridge submit chain.
-
-- **MAILBOX present mode is degenerate.** Apps that request
-  `VK_PRESENT_MODE_MAILBOX_KHR` expect to never block in
+- **MAILBOX present mode is degenerate** — pending v3.x. Apps that
+  request `VK_PRESENT_MODE_MAILBOX_KHR` expect to never block in
   `vkQueuePresentKHR` — new presents replace any unconsumed earlier
   ones in a single-deep mailbox slot, oldest dropped. Our current
   worker still uses the same single-slot mailbox as FIFO, so the app
@@ -310,14 +300,41 @@ The Lakka build recipe does this automatically.
   benefit of the drop-old-take-newest semantics. Apps that genuinely
   rely on MAILBOX latency characteristics (some game engines that
   want to render as fast as the GPU can but display at vsync) won't
-  see the behavior they expect. v3 will give the worker a proper
-  drop-old mailbox path for this mode: replace the contents of
+  see the behavior they expect. Plan: give the worker a proper
+  drop-old mailbox path for this mode — replace the contents of
   `worker_pending_idx` instead of blocking the producer, and free
   the displaced image's resources back to the acquire pool. The
   acquire-side semaphore bridging needs to handle the dropped image
-  cleanly too — the app's render-done semaphore for the dropped
-  frame must still get consumed somewhere, or the next submit waiting
-  on it will hang.
+  cleanly too — the app's render-done semaphore for the dropped frame
+  must still get consumed somewhere, or the next submit waiting on it
+  will hang.
+
+## Done in v3.0
+
+- **`VK_GOOGLE_display_timing`** is now implemented. Apps that use the
+  extension to compute frame-drop metrics (Chromium, GeForce NOW
+  client, some game engines) receive accurate per-present timing data
+  instead of falling back to the over-reporting heuristic.
+
+  Implementation:
+  - The layer advertises `VK_GOOGLE_display_timing` v1 via the manifest's
+    `device_extensions` list.
+  - `CreateDevice` strips this layer-provided extension from the
+    extension list before forwarding to the ICD (the ICD doesn't
+    implement it).
+  - `vkGetRefreshCycleDurationGOOGLE` returns the swapchain's measured
+    refresh duration. The value defaults to 1/60 Hz and is refined
+    online by an EWMA over inter-vblank intervals filtered to a
+    [50 Hz, 75 Hz] sanity range.
+  - `vkGetPastPresentationTimingGOOGLE` returns up to 64 most-recent
+    entries from a ring written by the worker thread immediately after
+    each `glXWaitVideoSyncSGI` returns.
+  - `VkPresentTimesInfoGOOGLE` is parsed out of `vkQueuePresentKHR`'s
+    pNext chain; `presentID` and `desiredPresentTime` are plumbed to
+    the worker through the mailbox and recorded in the ring.
+  - Presents without a presentID (apps not using the extension) are
+    not recorded, keeping the ring focused on what the app actually
+    wants to track.
 
 ## Alpha and compositor blending
 

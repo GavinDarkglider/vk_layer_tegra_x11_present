@@ -872,7 +872,31 @@ typedef struct Swapchain {
     pthread_cond_t   worker_cv_done;      /* app waits on this when posting to full slot */
     bool             worker_pending;      /* slot has work? */
     uint32_t         worker_pending_idx;  /* image index in pending slot */
+    /* VK_GOOGLE_display_timing: presentID and desiredPresentTime supplied
+       by the app for the pending work (zero if not set). The worker
+       captures actualPresentTime when the SGI vblank wait returns and
+       pushes a history entry. */
+    uint32_t         worker_pending_present_id;
+    uint64_t         worker_pending_desired_ns;
     bool             worker_quit;
+
+    /* Display-timing history ring, written by the worker after each
+       vblank, read by vkGetPastPresentationTimingGOOGLE. The lock
+       protects head/tail/count; the contents themselves are pure
+       value-copies so no aliasing concern.
+
+       64 entries is generous — the spec just requires us to remember
+       "the most recent" presents; apps that drain regularly never see
+       it fill up. If full, the oldest entry is overwritten — apps that
+       don't poll lose old history but always see recent. */
+    pthread_mutex_t  timing_lock;
+    uint32_t         timing_count;        /* number of valid entries */
+    uint32_t         timing_head;         /* index of oldest entry */
+    VkPastPresentationTimingGOOGLE timing_ring[64];
+    /* Measured refresh duration in nanoseconds. Filled in at swapchain
+       create time from one observed inter-vblank interval, falling back
+       to a conservative 60 Hz if measurement fails. */
+    uint64_t         refresh_duration_ns;
 
     pthread_mutex_t lock;
 } Swapchain;
@@ -1067,6 +1091,12 @@ static void *worker_thread_main(void *arg) {
     int last_win_w = sc->win_w, last_win_h = sc->win_h;
     glViewport(0, 0, last_win_w, last_win_h);
 
+    /* Tracks the previous vblank wall-clock time for refresh-duration
+       measurement. Zero on the first iteration; set after each vsync
+       wait. Local because the worker thread runs the same loop for the
+       swapchain's lifetime. */
+    uint64_t prev_vblank_ns = 0;
+
     for (;;) {
         /* Wait for work or shutdown. */
         pthread_mutex_lock(&sc->worker_lock);
@@ -1077,6 +1107,8 @@ static void *worker_thread_main(void *arg) {
             break;
         }
         uint32_t idx = sc->worker_pending_idx;
+        uint32_t present_id = sc->worker_pending_present_id;
+        uint64_t desired_ns = sc->worker_pending_desired_ns;
         pthread_mutex_unlock(&sc->worker_lock);
 
         /* Refresh window size if changed. Cheap when unchanged. Use the
@@ -1148,6 +1180,62 @@ static void *worker_thread_main(void *arg) {
             }
         }
 
+        /* Capture actual present time right after vblank for
+           VK_GOOGLE_display_timing reporting. CLOCK_MONOTONIC matches
+           the clock domain the spec calls "any user-defined timeline"
+           and is what most apps that consume this extension assume. */
+        uint64_t actual_ns;
+        {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            actual_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        }
+
+        /* Refine the reported refresh duration from observed
+           inter-vblank intervals. EWMA over a long window keeps the
+           value stable; bias initially toward the default until a few
+           frames have elapsed. We deliberately use the inter-frame
+           interval observed AT vsync, which means glXWaitVideoSyncSGI
+           actually fired — outliers from missed vblanks would inflate
+           the average. We filter to [13ms, 21ms] which covers
+           50-75Hz; anything outside that range is treated as bogus and
+           ignored (e.g. an app that hides the window briefly). */
+        if (prev_vblank_ns != 0) {
+            uint64_t dt = actual_ns - prev_vblank_ns;
+            if (dt > 13000000ULL && dt < 21000000ULL) {
+                uint64_t cur = sc->refresh_duration_ns;
+                /* EWMA: 1/8 new, 7/8 old. Converges in ~30 frames from a
+                   default to true rate, then tracks slow drift. */
+                sc->refresh_duration_ns = (7 * cur + dt) / 8;
+            }
+        }
+        prev_vblank_ns = actual_ns;
+
+        /* If the app marked this present with a presentID (via
+           VkPresentTimesInfoGOOGLE in pNext of VkPresentInfoKHR), push
+           a history entry. Apps that don't use the extension never set
+           presentID, so the zero check filters their non-tracked
+           presents out — keeps the ring uncluttered for apps that do
+           use both modes. */
+        if (present_id != 0) {
+            pthread_mutex_lock(&sc->timing_lock);
+            uint32_t slot;
+            if (sc->timing_count < 64) {
+                slot = (sc->timing_head + sc->timing_count) & 63;
+                sc->timing_count++;
+            } else {
+                /* Ring full — overwrite oldest, advance head. */
+                slot = sc->timing_head;
+                sc->timing_head = (sc->timing_head + 1) & 63;
+            }
+            VkPastPresentationTimingGOOGLE *e = &sc->timing_ring[slot];
+            e->presentID          = present_id;
+            e->desiredPresentTime = desired_ns;
+            e->actualPresentTime  = actual_ns;
+            e->earliestPresentTime = actual_ns;        /* we don't pre-empt */
+            e->presentMargin       = 0;                 /* unknown / not tracked */
+            pthread_mutex_unlock(&sc->timing_lock);
+        }
+
         /* Mark slot free AFTER the present completes. This is the
            backpressure point: while worker_pending is true, any caller in
            worker_post blocks. */
@@ -1169,14 +1257,22 @@ static void *worker_thread_main(void *arg) {
 }
 
 /* Post an image index to the worker's pending slot. Blocks if the slot is
-   currently full, which provides natural backpressure. */
-static void worker_post(Swapchain *sc, uint32_t idx) {
+   currently full, which provides natural backpressure.
+
+   present_id and desired_ns come from a VkPresentTimesInfoGOOGLE pNext on
+   the app's VkPresentInfoKHR; both zero when the app isn't using the
+   display-timing extension. The worker uses these to populate
+   VK_GOOGLE_display_timing history entries after the present completes. */
+static void worker_post(Swapchain *sc, uint32_t idx,
+                        uint32_t present_id, uint64_t desired_ns) {
     pthread_mutex_lock(&sc->worker_lock);
     while (sc->worker_pending && sc->worker_running)
         pthread_cond_wait(&sc->worker_cv_done, &sc->worker_lock);
     if (!sc->worker_running) { pthread_mutex_unlock(&sc->worker_lock); return; }
     sc->worker_pending = true;
     sc->worker_pending_idx = idx;
+    sc->worker_pending_present_id = present_id;
+    sc->worker_pending_desired_ns = desired_ns;
     pthread_cond_signal(&sc->worker_cv_pending);
     pthread_mutex_unlock(&sc->worker_lock);
 }
@@ -1925,6 +2021,10 @@ layer_CreateSwapchainKHR(VkDevice device,
     pthread_mutex_init(&sc->worker_lock, NULL);
     pthread_cond_init(&sc->worker_cv_pending, NULL);
     pthread_cond_init(&sc->worker_cv_done, NULL);
+    pthread_mutex_init(&sc->timing_lock, NULL);
+    /* Default refresh duration to 60Hz; the worker will refine this
+       from observed SGI vblank intervals once it starts running. */
+    sc->refresh_duration_ns = 16666667ULL;
     sc->worker_running = true;
     if (pthread_create(&sc->worker, NULL, worker_thread_main, sc) != 0) {
         LOG_ERR("pthread_create(worker) failed");
@@ -1992,6 +2092,7 @@ layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
     pthread_cond_destroy(&sc->worker_cv_pending);
     pthread_cond_destroy(&sc->worker_cv_done);
     pthread_mutex_destroy(&sc->worker_lock);
+    pthread_mutex_destroy(&sc->timing_lock);
     memset(sc, 0, sizeof(*sc));
     free(sc);
 }
@@ -2009,6 +2110,63 @@ layer_GetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
     for (uint32_t i = 0; i < n; i++) pImages[i] = sc->images[i].image;
     *pCount = n;
     return n == sc->image_count ? VK_SUCCESS : VK_INCOMPLETE;
+}
+
+/* ----------------------------------------------------------------------- */
+/* VK_GOOGLE_display_timing                                                */
+/* ----------------------------------------------------------------------- */
+
+/* Report the display's refresh cycle duration to the application.
+   The value is set at swapchain creation; we use a sensible default of
+   1/60Hz and the worker refines it from observed inter-vblank intervals
+   as the app runs. */
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
+layer_GetRefreshCycleDurationGOOGLE(VkDevice device, VkSwapchainKHR swapchain,
+                                     VkRefreshCycleDurationGOOGLE *pDisplayTimingProperties) {
+    (void)device;
+    Swapchain *sc = as_swapchain(swapchain);
+    if (!sc || !pDisplayTimingProperties) return VK_ERROR_INITIALIZATION_FAILED;
+    pDisplayTimingProperties->refreshDuration = sc->refresh_duration_ns;
+    return VK_SUCCESS;
+}
+
+/* Return past presentation timing history. Standard count-query pattern:
+   if pPresentationTimings is NULL, write the count of available entries
+   to *pPresentationTimingCount. Otherwise, copy up to
+   *pPresentationTimingCount entries into the output array and update
+   the count to how many were actually written. Returned entries are
+   removed from our ring. */
+VK_LAYER_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
+layer_GetPastPresentationTimingGOOGLE(VkDevice device, VkSwapchainKHR swapchain,
+                                       uint32_t *pPresentationTimingCount,
+                                       VkPastPresentationTimingGOOGLE *pPresentationTimings) {
+    (void)device;
+    Swapchain *sc = as_swapchain(swapchain);
+    if (!sc || !pPresentationTimingCount) return VK_ERROR_INITIALIZATION_FAILED;
+
+    pthread_mutex_lock(&sc->timing_lock);
+
+    if (pPresentationTimings == NULL) {
+        *pPresentationTimingCount = sc->timing_count;
+        pthread_mutex_unlock(&sc->timing_lock);
+        return VK_SUCCESS;
+    }
+
+    uint32_t want = *pPresentationTimingCount;
+    uint32_t have = sc->timing_count;
+    uint32_t out  = want < have ? want : have;
+    for (uint32_t i = 0; i < out; i++) {
+        uint32_t slot = (sc->timing_head + i) & 63;
+        pPresentationTimings[i] = sc->timing_ring[slot];
+    }
+    /* Consume the entries we returned. */
+    sc->timing_head  = (sc->timing_head + out) & 63;
+    sc->timing_count = have - out;
+    *pPresentationTimingCount = out;
+
+    VkResult r = (out < have) ? VK_INCOMPLETE : VK_SUCCESS;
+    pthread_mutex_unlock(&sc->timing_lock);
+    return r;
 }
 
 /* ----------------------------------------------------------------------- */
@@ -2375,6 +2533,23 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
              (void*)queue, (void*)dev->graphics_queue,
              pInfo->swapchainCount, pInfo->waitSemaphoreCount);
 
+    /* Walk the pNext chain looking for VkPresentTimesInfoGOOGLE. If
+       found, its pTimes[s] gives presentID and desiredPresentTime for
+       swapchain index s. swapchainCount in that struct must equal the
+       outer pInfo->swapchainCount per the extension spec; we trust the
+       app on that. */
+    const VkPresentTimesInfoGOOGLE *times_info = NULL;
+    {
+        const VkBaseInStructure *p = (const VkBaseInStructure *)pInfo->pNext;
+        while (p) {
+            if (p->sType == VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE) {
+                times_info = (const VkPresentTimesInfoGOOGLE *)p;
+                break;
+            }
+            p = p->pNext;
+        }
+    }
+
     VkResult overall = VK_SUCCESS;
 
     for (uint32_t s = 0; s < pInfo->swapchainCount; s++) {
@@ -2436,7 +2611,13 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pInfo) {
         sc->images[idx].acquired = false;
         pthread_mutex_unlock(&sc->lock);
 
-        worker_post(sc, idx);
+        uint32_t present_id = 0;
+        uint64_t desired_ns = 0;
+        if (times_info && times_info->pTimes && s < times_info->swapchainCount) {
+            present_id = times_info->pTimes[s].presentID;
+            desired_ns = times_info->pTimes[s].desiredPresentTime;
+        }
+        worker_post(sc, idx, present_id, desired_ns);
 
         if (pInfo->pResults) pInfo->pResults[s] = VK_SUCCESS;
     }
@@ -2584,18 +2765,38 @@ layer_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *ci,
     }
     for (uint32_t j = 0; j < n_required; j++) if (need[j]) to_add++;
 
+    /* Extensions this LAYER provides to applications but which the
+       underlying ICD does NOT implement. We must strip these from the
+       extension list before passing CreateDevice down — otherwise the
+       ICD rejects device creation with ERROR_EXTENSION_NOT_PRESENT.
+       Apps that enable these extensions still get them: our intercepts
+       are wired in at GetDeviceProcAddr time regardless of what the ICD
+       says. */
+    static const char *layer_provided[] = {
+        "VK_GOOGLE_display_timing",
+    };
+    static const uint32_t n_layer_provided = 1;
+
+    /* Build the down-going extension list: app's list minus any
+       layer-provided names, plus our required extensions if not
+       already present. We always allocate a new array since we may need
+       to delete entries even if to_add is zero. */
     VkDeviceCreateInfo modci = *ci;
-    const char **new_exts = NULL;
+    uint32_t copy_n = 0;
+    const char **new_exts = malloc(
+        (ci->enabledExtensionCount + to_add) * sizeof(const char *));
+    if (!new_exts) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
+        bool strip = false;
+        for (uint32_t j = 0; j < n_layer_provided; j++) {
+            if (!strcmp(ci->ppEnabledExtensionNames[i], layer_provided[j])) { strip = true; break; }
+        }
+        if (!strip) new_exts[copy_n++] = ci->ppEnabledExtensionNames[i];
+    }
+    for (uint32_t j = 0; j < n_required; j++) if (need[j]) new_exts[copy_n++] = required[j];
+    modci.enabledExtensionCount = copy_n;
+    modci.ppEnabledExtensionNames = new_exts;
     if (to_add > 0) {
-        uint32_t total = ci->enabledExtensionCount + to_add;
-        new_exts = malloc(total * sizeof(const char *));
-        if (!new_exts) return VK_ERROR_OUT_OF_HOST_MEMORY;
-        memcpy(new_exts, ci->ppEnabledExtensionNames,
-               ci->enabledExtensionCount * sizeof(const char *));
-        uint32_t k = ci->enabledExtensionCount;
-        for (uint32_t j = 0; j < n_required; j++) if (need[j]) new_exts[k++] = required[j];
-        modci.enabledExtensionCount = total;
-        modci.ppEnabledExtensionNames = new_exts;
         LOG_INFO("CreateDevice: appending %u required extensions", to_add);
     }
 
@@ -2729,6 +2930,8 @@ static PFN_vkVoidFunction layer_intercept_device(const char *name) {
     MATCH(GetSwapchainImagesKHR);
     MATCH(AcquireNextImageKHR);
     MATCH(QueuePresentKHR);
+    MATCH(GetRefreshCycleDurationGOOGLE);
+    MATCH(GetPastPresentationTimingGOOGLE);
     MATCH(QueueSubmit);
     MATCH(QueueWaitIdle);
     MATCH(DeviceWaitIdle);
