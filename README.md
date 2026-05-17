@@ -269,27 +269,30 @@ The Lakka build recipe does this automatically.
 - An NVIDIA Tegra Vulkan ICD (or any ICD that supports the OPAQUE_FD
   external memory/semaphore extensions and `GLX_SGI_video_sync`)
 
-## Known issues / planned
+## Known issues
 
-The layer is shipped as v3.1; the items below are scoped for future
-v3.x iterations.
+None confirmed against v3.1 at time of release.
 
-- **PPSSPP libretro core (some titles)** — pending v3.x. Some titles
-  trigger a GPU fault in PPSSPP's render path that returns
-  `VK_ERROR_DEVICE_LOST` from a later `vkQueueSubmit`. The crash
-  signature is consistent across titles: a few frame submits succeed,
-  then a secondary command-buffer submit (no semaphores, just a fence)
-  faults. We suspect a code path in our layer mishandles something
-  PPSSPP does that simpler apps don't — possibly a layout transition on
-  a command-buffer path we don't intercept (`vkCmdCopyImageToBuffer`,
-  `vkCmdBlitImage`, render passes with `VK_KHR_synchronization2`
-  barriers), or a usage-flag the swapchain image needs but we don't
-  provide. Without validation layers available on the deployment
-  targets we can't pinpoint the offending command. Plan: intercept the
-  remaining command-buffer entry points that take layouts; verify
-  usage flag plumbing against PPSSPP's actual swapchain create info;
-  if those don't reveal the issue, build a validation-layer-enabled
-  developer image to capture VUIDs.
+The earlier PPSSPP libretro core launch crash was resolved in v2 by
+adding the per-device queue submission mutex for spec-compliant
+external synchronization. Games launch and run.
+
+If a concrete reproduction of any new bug shows up, the first step is
+the control comparison — does the issue reproduce with the layer
+disabled?
+
+```sh
+# With layer (normal):
+DISPLAY=:0 VK_TEGRA_X11_PRESENT_LOG=2 \
+    VK_TEGRA_X11_PRESENT_LOG_FILE=/tmp/with-layer.log <command>
+
+# Without layer (the loader skips our manifest):
+DISPLAY=:0 VK_TEGRA_X11_PRESENT_DISABLE=1 <command>
+```
+
+If both runs reproduce the issue, it isn't the layer — report upstream
+to the app or the ICD vendor. If only the with-layer run fails, it's
+a real layer bug.
 
 ## Done in v3.1
 
@@ -382,4 +385,41 @@ vk_layer_tegra_x11_present.c     main source
 vk_layer_tegra_x11_present.json  Vulkan loader manifest
 vk_layer_tegra_x11_present.map   linker version script (export control)
 Makefile                         build and install
+COPYING                          full GPL-2.0 license text
 ```
+
+## Credits
+
+Authors:
+
+- **gavin_darkglider** — project owner, original concept, Lakka and
+  upstream Tegra integration, deployment.
+- **theofficialgman** — compositor-aware vsync strategy and direct/composited
+  swap-path separation; broader Tegra Vulkan/X11 expertise.
+- **Anthropic Claude (AI assistant)** — implementation work across the
+  layer's architecture and iteration cycles.
+
+Honorable mentions, without whose work the platform this layer runs on
+wouldn't exist:
+
+- **Ctcaer** — roughly 90% of the kernel work for Switch L4T.
+- **Azkali**
+- **makinbacon**
+
+Thanks to testers who put real hardware time into shaking out bugs that
+no synthetic test would have caught:
+
+- **Angel_hp**
+- **Zenjiki**
+- **Kinro**
+
+## License
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version. See `COPYING` for the full
+license text.
+
+Source files carry an `SPDX-License-Identifier: GPL-2.0-or-later` tag
+in their header for machine-readable license tooling.

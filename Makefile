@@ -1,3 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Copyright (C) 2026 gavin_darkglider
+# Copyright (C) 2026 theofficialgman
+# Copyright (C) 2026 Anthropic (Claude AI assistant contributions)
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+
 # Makefile for vk_layer_tegra_x11_present
 #
 # Builds an implicit Vulkan layer that fixes Tegra L4T r32.x's broken X11
